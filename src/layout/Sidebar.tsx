@@ -1,0 +1,52 @@
+import { useEffect, useState } from "react";
+import { NavLink } from "react-router-dom";
+import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import { navItems } from "./nav";
+import { getEngineStatus, type EngineStatus } from "../lib/api";
+
+export default function Sidebar() {
+  const [collapsed, setCollapsed] = useState(false);
+  const [engine, setEngine] = useState<EngineStatus | null>(null);
+
+  useEffect(() => {
+    getEngineStatus().then(setEngine).catch(() => setEngine(null));
+  }, []);
+
+  return (
+    <aside className={`sidebar${collapsed ? " collapsed" : ""}`}>
+      <div className="sidebar-brand">
+        <img src="/app-icon.png" alt="" className="brand-logo" />
+        {!collapsed && (
+          <div className="brand-text">
+            <strong>TuJiao Vision</strong>
+            <span>涂胶检测</span>
+          </div>
+        )}
+      </div>
+
+      <nav className="sidebar-nav">
+        {navItems.map(({ path, label, icon: Icon }) => (
+          <NavLink
+            key={path}
+            to={path}
+            title={collapsed ? label : undefined}
+            className={({ isActive }) => `nav-item${isActive ? " active" : ""}`}
+          >
+            <Icon size={18} />
+            {!collapsed && <span>{label}</span>}
+          </NavLink>
+        ))}
+      </nav>
+
+      <div className="sidebar-footer">
+        <div className="engine-status" title={engine?.message ?? "未连接后端"}>
+          <span className={`dot ${engine?.ready ? "ok" : "warn"}`} />
+          {!collapsed && <span>{engine ? `${engine.backend} · ${engine.ready ? "就绪" : "未就绪"}` : "后端未连接"}</span>}
+        </div>
+        <button className="icon-btn" onClick={() => setCollapsed((v) => !v)} aria-label="折叠侧边栏">
+          {collapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
+        </button>
+      </div>
+    </aside>
+  );
+}
