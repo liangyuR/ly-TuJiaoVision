@@ -199,3 +199,7 @@ h1, h3, p { margin: 0; }
 .kv { display: grid; grid-template-columns: 80px 1fr; gap: 10px 16px; margin: 0; }
 .kv dt { color: var(--text-muted); }
 .kv dd { margin: 0; }
+
+.status-list { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.dot.err { background: var(--ng); }
+.dot.off { background: #475569; }

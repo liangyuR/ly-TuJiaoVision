@@ -3,10 +3,13 @@ import { NavLink } from "react-router-dom";
 import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import { navItems } from "./nav";
 import { getEngineStatus, type EngineStatus } from "../lib/api";
+import { linkStateLabels, usePlcStatus } from "../features/plc";
 
 export default function Sidebar() {
   const [collapsed, setCollapsed] = useState(false);
   const [engine, setEngine] = useState<EngineStatus | null>(null);
+  const plc = usePlcStatus();
+  const plcDot = { connected: "ok", connecting: "warn", error: "err", disconnected: "off" }[plc?.state ?? "disconnected"];
 
   useEffect(() => {
     getEngineStatus().then(setEngine).catch(() => setEngine(null));
@@ -39,9 +42,15 @@ export default function Sidebar() {
       </nav>
 
       <div className="sidebar-footer">
-        <div className="engine-status" title={engine?.message ?? "未连接后端"}>
-          <span className={`dot ${engine?.ready ? "ok" : "warn"}`} />
-          {!collapsed && <span>{engine ? `${engine.backend} · ${engine.ready ? "就绪" : "未就绪"}` : "后端未连接"}</span>}
+        <div className="status-list">
+          <div className="engine-status" title={plc?.message ?? "PLC 未连接"}>
+            <span className={`dot ${plcDot}`} />
+            {!collapsed && <span>PLC · {linkStateLabels[plc?.state ?? "disconnected"]}</span>}
+          </div>
+          <div className="engine-status" title={engine?.message ?? "未连接后端"}>
+            <span className={`dot ${engine?.ready ? "ok" : "warn"}`} />
+            {!collapsed && <span>{engine ? `${engine.backend} · ${engine.ready ? "就绪" : "未就绪"}` : "后端未连接"}</span>}
+          </div>
         </div>
         <button className="icon-btn" onClick={() => setCollapsed((v) => !v)} aria-label="折叠侧边栏">
           {collapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}

@@ -1,0 +1,87 @@
+import { useState } from "react";
+import Modal from "./Modal";
+import { dataTypeLabels, formatValue } from "../meta";
+import type { PlcPoint, PointValue } from "../types";
+
+interface WriteDialogProps {
+  point: PlcPoint;
+  current: PointValue | undefined;
+  onWrite: (value: unknown) => Promise<void>;
+  onClose: () => void;
+}
+
+export default function WriteDialog({ point, current, onWrite, onClose }: WriteDialogProps) {
+  const [text, setText] = useState(current?.value !== null && current?.value !== undefined ? String(Number(current.value)) : "");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const isBool = point.dataType === "bool";
+
+  const write = async (value: unknown) => {
+    setBusy(true);
+    setError("");
+    try {
+      await onWrite(value);
+      onClose();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submitNumber = () => {
+    const n = Number(text);
+    if (text.trim() === "" || Number.isNaN(n)) return setError("请输入有效数值");
+    write(n);
+  };
+
+  return (
+    <Modal
+      title={`写入 · ${point.name}`}
+      onClose={onClose}
+      width={420}
+      footer={
+        <>
+          {error && <span className="form-error">{error}</span>}
+          <button className="btn" onClick={onClose}>
+            取消
+          </button>
+          {!isBool && (
+            <button className="btn primary" disabled={busy} onClick={submitNumber}>
+              写入
+            </button>
+          )}
+        </>
+      }
+    >
+      <dl className="kv">
+        <dt>地址</dt>
+        <dd className="mono">{point.address}</dd>
+        <dt>类型</dt>
+        <dd>{dataTypeLabels[point.dataType]}</dd>
+        <dt>当前值</dt>
+        <dd className="mono">{formatValue(current)}</dd>
+      </dl>
+      <div className="write-input">
+        {isBool ? (
+          <div className="row">
+            <button className="btn primary" disabled={busy} onClick={() => write(true)}>
+              置 1 (ON)
+            </button>
+            <button className="btn" disabled={busy} onClick={() => write(false)}>
+              置 0 (OFF)
+            </button>
+          </div>
+        ) : (
+          <input
+            className="input mono"
+            autoFocus
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && submitNumber()}
+          />
+        )}
+      </div>
+    </Modal>
+  );
+}
