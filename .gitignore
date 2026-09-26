@@ -10,3 +10,6 @@ src-tauri/gen/schemas
 *.tsbuildinfo
 vite.config.js
 vite.config.d.ts
+
+# 海康 MVS SDK 运行日志
+MvSDKLog/

@@ -1,3 +1,5 @@
+import type { CameraStatus } from "../camera/types";
+
 export type Phase = "IDLE" | "VALIDATE" | "ACQUIRE" | "DRAIN" | "JUDGE" | "REPORT" | "RELEASE" | "FAULT";
 export type FrameStatus = "waiting" | "measuring" | "done" | "locateFailed" | "missing";
 export type Verdict = "OK" | "OK_WITH_EXCURSION" | "NG_POSITION" | "NG_ABSOLUTE" | "NG_GAP" | "ERR_INSPECT";
@@ -99,13 +101,6 @@ export interface ResultView {
   reason: string;
   segments: SegmentResult[];
   gaps: GapRun[];
-}
-
-export interface CameraStatus {
-  source: string;
-  ready: boolean;
-  triggers: number;
-  frames: number;
 }
 
 export interface Snapshot {

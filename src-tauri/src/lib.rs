@@ -5,6 +5,7 @@ mod detection;
 mod inspection;
 mod judge;
 mod measure;
+mod mvs;
 mod plc;
 mod recipe;
 mod settings;
@@ -19,6 +20,7 @@ pub fn run() {
             app.manage(plc::PlcHost::init(app.handle())?);
             plc::PlcHost::start_if_configured(app.handle());
             cycle::CycleHost::start(app.handle());
+            camera::CameraHost::start(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -43,6 +45,15 @@ pub fn run() {
             cycle::cycle_save_settings,
             cycle::cycle_select_recipe,
             cycle::cycle_reset,
+            camera::camera_status,
+            camera::camera_get_config,
+            camera::camera_save_config,
+            camera::camera_list_devices,
+            camera::camera_preview,
+            camera::camera_soft_trigger,
+            camera::camera_dry_run_start,
+            camera::camera_dry_run_get,
+            camera::camera_dry_run_stop,
             sim::sim_status,
             sim::sim_start,
             sim::sim_stop,

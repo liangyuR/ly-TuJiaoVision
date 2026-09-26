@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::camera::{CameraStatus, Frame, SimCamera};
+use crate::camera::{CameraHost, CameraStatus, Frame};
 use crate::inspection::{read_tag_u32, tag, tag_is_on, write_tag};
 use crate::judge::{self, fault, Judgement, PointState, Verdict};
 use crate::measure::{self, Job, Measured};
@@ -159,7 +159,7 @@ struct Shared {
 
 pub struct CycleHost {
     pub tx: UnboundedSender<Input>,
-    pub camera: SimCamera,
+    pub camera: CameraHost,
     pub sim: SimCtl,
     recipes: Vec<Arc<Recipe>>,
     settings_path: PathBuf,
@@ -172,7 +172,7 @@ impl CycleHost {
         let settings_path = app.path().app_config_dir().map_err(|e| e.to_string())?.join("cycle.json");
         let (tx, rx) = unbounded_channel();
         Ok(Self {
-            camera: SimCamera::new(tx.clone()),
+            camera: CameraHost::new(app, tx.clone())?,
             tx,
             sim: SimCtl::default(),
             recipes: recipe::builtin(),
@@ -209,6 +209,10 @@ impl CycleHost {
         });
     }
 
+    pub fn phase(&self) -> Phase {
+        self.shared.lock().unwrap().snapshot.as_ref().map_or(Phase::Idle, |s| s.phase)
+    }
+
     pub fn recipe(&self, id: &str) -> Option<Arc<Recipe>> {
         self.recipes.iter().find(|r| r.id == id).cloned()
     }
@@ -226,7 +230,7 @@ fn host(app: &AppHandle) -> &CycleHost {
     app.state::<CycleHost>().inner()
 }
 
-fn log(app: &AppHandle, level: &'static str, ev: impl Into<String>, msg: impl Into<String>) {
+pub fn log(app: &AppHandle, level: &'static str, ev: impl Into<String>, msg: impl Into<String>) {
     let line = LogLine { ts: now_ms(), level, ev: ev.into(), msg: msg.into() };
     {
         let mut s = host(app).shared.lock().unwrap();
@@ -252,10 +256,10 @@ struct Part {
     received: usize,
     extra: usize,
     queue: usize,
-    base_frame: u64,
-    base_trigger: u64,
-    last_frame: u64,
-    last_trigger: u64,
+    first_frame: Option<u64>,
+    prev: Option<(u64, usize)>,
+    base_trigger: Option<u64>,
+    last_trigger: Option<u64>,
     armed_at: Instant,
     end_at: Option<Instant>,
     fault: Option<(u16, String)>,
@@ -266,13 +270,20 @@ impl Part {
         self.recipe.shot_count()
     }
 
+    fn triggers(&self) -> u64 {
+        match (self.base_trigger, self.last_trigger) {
+            (Some(b), Some(l)) => l.saturating_sub(b),
+            _ => 0,
+        }
+    }
+
     fn view(&self) -> PartView {
         PartView {
             sn: self.sn,
             recipe_id: self.recipe.id.clone(),
             n: self.n(),
             received: self.received,
-            triggers: self.last_trigger.saturating_sub(self.base_trigger),
+            triggers: self.triggers(),
             queue: self.queue,
             filled: self.table.iter().filter(|p| **p != PointState::Pending).count(),
             total: self.table.len(),
@@ -443,6 +454,11 @@ impl Machine {
         }
 
         let cam = host.camera.status();
+        if !cam.ready {
+            let reason = format!("相机未就绪：{}", cam.message);
+            log(&app, "err", "校验失败", format!("{reason}，不布防"));
+            return self.report(sn, Some(recipe.id.clone()), Judgement::error(fault::DEVICE_LOST, reason)).await;
+        }
         self.part = Some(Part {
             sn,
             scenario: host.sim.part_scenario(),
@@ -452,10 +468,10 @@ impl Machine {
             received: 0,
             extra: 0,
             queue: 0,
-            base_frame: cam.frames,
-            base_trigger: cam.triggers,
-            last_frame: cam.frames,
-            last_trigger: cam.triggers,
+            first_frame: None,
+            prev: None,
+            base_trigger: None,
+            last_trigger: None,
             armed_at: Instant::now(),
             end_at: None,
             fault: None,
@@ -487,31 +503,36 @@ impl Machine {
             return;
         };
         part.received += 1;
-        let jump = f.frame_counter != part.last_frame + 1;
-        part.last_frame = f.frame_counter;
-        part.last_trigger = f.trigger_counter;
-        // 有 Chunk 帧计数时按它定位 k：中途丢一帧后，后续帧仍能落到正确的拍照点上（整件仍判漏帧）。
-        let k = (f.frame_counter.saturating_sub(part.base_frame + 1)) as usize;
+        // 本件第一帧为 k=0；之后按帧计数的增量推进，中途丢帧时后续帧仍落到正确的拍照点上（整件仍判漏帧）。
+        let (k, jump) = match part.prev {
+            None => (0, false),
+            Some((fc, k)) => (k + f.frame_counter.saturating_sub(fc).max(1) as usize, f.frame_counter != fc + 1),
+        };
+        let first = *part.first_frame.get_or_insert(f.frame_counter.saturating_sub(1));
+        let base_trigger = *part.base_trigger.get_or_insert(f.trigger_counter.saturating_sub(1));
+        part.prev = Some((f.frame_counter, k));
+        part.last_trigger = Some(f.trigger_counter);
         if k >= part.n() || part.frames[k].status != FrameStatus::Waiting {
             part.extra += 1;
-            log(&self.app, "err", "多帧", format!("帧计数 {} 超出计划 N={}", f.frame_counter - part.base_frame, part.n()));
+            log(&self.app, "err", "多帧", format!("第 {} 帧超出计划 N={}", f.frame_counter - first, part.n()));
             return;
         }
         part.frames[k] = FrameView {
             status: FrameStatus::Measuring,
             arrived_ms: Some(part.armed_at.elapsed().as_millis() as u64),
-            frame_counter: Some(f.frame_counter - part.base_frame),
-            trigger_counter: Some(f.trigger_counter - part.base_trigger),
+            frame_counter: Some(f.frame_counter - first),
+            trigger_counter: Some(f.trigger_counter.saturating_sub(base_trigger)),
             counter_jump: jump,
             ..FrameView::waiting()
         };
         part.measuring_since[k] = Some(Instant::now());
         part.queue += 1;
         let _ = self.measure_tx.send(Job { sn: part.sn, k, recipe: part.recipe.clone(), scenario: part.scenario });
+        let lost = if f.lost_packets > 0 { format!(" · 丢包 {}", f.lost_packets) } else { String::new() };
         let msg = format!(
-            "k={k} · Chunk 帧 {} 触发 {}{}",
-            f.frame_counter - part.base_frame,
-            f.trigger_counter - part.base_trigger,
+            "k={k} · Chunk 帧 {} 触发 {}{}{lost}",
+            f.frame_counter - first,
+            f.trigger_counter.saturating_sub(base_trigger),
             if jump { "（帧计数跳号）" } else { "" }
         );
         log(&self.app, if jump { "err" } else { "info" }, "帧到达", msg);
@@ -547,9 +568,23 @@ impl Machine {
 
     async fn on_tick(&mut self) {
         let connected = plc(&self.app).status().state == LinkState::Connected;
-        if !connected && self.phase != Phase::Fault {
-            return self.enter_fault("PLC 未连接".into());
+        let camera = host(&self.app).camera.status();
+        if self.phase != Phase::Fault {
+            if !connected {
+                return self.enter_fault("PLC 未连接".into());
+            }
+            if !camera.ready {
+                return self.enter_fault(format!("相机未就绪：{}", camera.message));
+            }
         }
+        if self.phase == Phase::Fault && !camera.ready {
+            let reason = format!("相机未就绪：{}", camera.message);
+            if self.fault.as_deref() != Some(reason.as_str()) && self.fault.as_deref().is_some_and(|f| f.starts_with("相机")) {
+                self.fault = Some(reason);
+                self.dirty = true;
+            }
+        }
+        let connected = connected && camera.ready;
         let timeouts = host(&self.app).settings().timeouts;
         match self.phase {
             Phase::Fault if connected && !self.fault_needs_reset => self.recover().await,
@@ -608,7 +643,7 @@ impl Machine {
                 f.status = FrameStatus::Missing;
             }
         }
-        let triggers = part.last_trigger - part.base_trigger;
+        let triggers = part.triggers();
         let judgement = if let Some((code, reason)) = part.fault.clone() {
             Judgement::error(code, reason)
         } else if !missing.is_empty() {
@@ -715,7 +750,7 @@ impl Machine {
         }
         self.fault_needs_reset = false;
         log(&self.app, "info", "故障复位", "");
-        if plc(&self.app).status().state == LinkState::Connected {
+        if plc(&self.app).status().state == LinkState::Connected && host(&self.app).camera.status().ready {
             self.recover().await;
         }
     }

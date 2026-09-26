@@ -139,7 +139,7 @@ async fn run_part(app: &AppHandle, recipe: &Recipe, scenario: Scenario) -> Resul
         let lost = scenario.lost_frame(n);
         for k in 0..n {
             sleep(Duration::from_millis(interval)).await;
-            cycle.camera.trigger(lost == Some(k));
+            let _ = cycle.camera.trigger(lost == Some(k));
         }
         sleep(Duration::from_millis(300)).await;
         put(app, tag::PART_END, json!(true)).await?;
@@ -207,6 +207,10 @@ pub fn sim_start(
     }
     if plc.engine().status().state != ly_plc::LinkState::Connected {
         return Err("PLC 模拟器未连接".into());
+    }
+    let cam = cycle.camera.config();
+    if cam.source == crate::camera::CameraSource::Mvs && cam.trigger_source != "Software" {
+        return Err("相机触发源为 Line0，模拟节拍发不出硬触发；改为 Software 或切换到模拟相机".into());
     }
     let recipe = cycle.recipe(&recipe_id).ok_or("配方不存在")?;
     if cycle.sim.running.swap(true, Ordering::SeqCst) {
