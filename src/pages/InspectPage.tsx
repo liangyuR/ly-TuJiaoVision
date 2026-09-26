@@ -309,7 +309,7 @@ function EventLog({ logs }: { logs: LogLine[] }) {
 function Stats({ snapshot }: { snapshot: Snapshot | null }) {
   const s = snapshot?.stats ?? { total: 0, ok: 0, ng: 0, err: 0 };
   const items: [string, string | number, string][] = [
-    ["总数", s.total, ""],
+    ["今日", s.total, ""],
     ["OK", s.ok, "c-ok"],
     ["NG", s.ng, "c-ng"],
     ["ERR", s.err, "c-err"],

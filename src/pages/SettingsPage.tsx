@@ -63,6 +63,17 @@ function CycleSettingsPanel() {
             </select>
           </label>
         )}
+        <label className="field" title="超过天数的检测记录每天自动删除">
+          <span>记录保留（天）</span>
+          <input
+            id="history-days"
+            className="input mono"
+            type="number"
+            min={1}
+            value={settings.historyDays}
+            onChange={(e) => setSettings({ ...settings, historyDays: Number(e.target.value) })}
+          />
+        </label>
         {timeoutFields.map(([key, label, hint]) => (
           <label key={key} className="field" title={hint}>
             <span>{label}</span>

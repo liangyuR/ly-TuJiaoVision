@@ -1,4 +1,4 @@
-import type { Measured, PartView, PointVis, Recipe, ResultView } from "./types";
+import type { Judgement, Measured, PartView, PointVis, Recipe } from "./types";
 
 export const visColor: Record<PointVis, string> = {
   none: "#3b4a66",
@@ -10,7 +10,7 @@ export const visColor: Record<PointVis, string> = {
   miss: "#a78bfa",
 };
 
-export function computeVis(layout: Recipe, part: PartView | null, measured: Measured[], result: ResultView | null): PointVis[] {
+export function computeVis(layout: Recipe, part: PartView | null, measured: Measured[], result: Judgement | null): PointVis[] {
   const n = layout.points.k.length;
   const vis: PointVis[] = new Array(n).fill("none");
   if (!part || part.recipeId !== layout.id) return vis;

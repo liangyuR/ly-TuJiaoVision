@@ -1,23 +1,23 @@
 use std::f32::consts::PI;
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SegmentKind {
     Line,
     Corner,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TriggerMode {
     Fly,
     Stop,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JudgeParams {
     pub nominal: f32,
@@ -37,7 +37,7 @@ impl JudgeParams {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Segment {
     pub name: String,
@@ -48,7 +48,7 @@ pub struct Segment {
 }
 
 /// 名义胶路上的测量点，按弧长等间距排列，第 j 个点的弧长为 j * spacing。
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PathPoints {
     pub x: Vec<f32>,
     pub y: Vec<f32>,
@@ -56,7 +56,7 @@ pub struct PathPoints {
     pub k: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Recipe {
     pub id: String,

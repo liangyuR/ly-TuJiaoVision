@@ -50,11 +50,12 @@ pub struct CycleSettings {
     pub product_source: ProductSource,
     pub manual_recipe_id: Option<String>,
     pub timeouts: Timeouts,
+    pub history_days: u32,
 }
 
 impl Default for CycleSettings {
     fn default() -> Self {
-        Self { product_source: ProductSource::Plc, manual_recipe_id: None, timeouts: Timeouts::default() }
+        Self { product_source: ProductSource::Plc, manual_recipe_id: None, timeouts: Timeouts::default(), history_days: 180 }
     }
 }
 
@@ -75,6 +76,9 @@ impl CycleSettings {
         let t = &self.timeouts;
         if t.drain_ms < 200 {
             return Err("收尾等待不能小于 200 ms".into());
+        }
+        if !(1..=3650).contains(&self.history_days) {
+            return Err("记录保留天数需在 1–3650 之间".into());
         }
         if t.motion_ms < 1000 || t.proc_ms < 200 || t.ack_ms < 500 {
             return Err("超时参数过小".into());

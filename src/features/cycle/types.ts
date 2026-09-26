@@ -90,17 +90,20 @@ export interface GapRun {
   frames: number[];
 }
 
-export interface ResultView {
-  sn: number;
-  recipeId: string | null;
-  ts: number;
-  drainMs: number | null;
+export interface Judgement {
   verdict: Verdict;
   plcCode: number;
   faultCode: number;
   reason: string;
   segments: SegmentResult[];
   gaps: GapRun[];
+}
+
+export interface ResultView extends Judgement {
+  sn: number;
+  recipeId: string | null;
+  ts: number;
+  drainMs: number | null;
 }
 
 export interface Snapshot {
@@ -148,6 +151,7 @@ export interface CycleSettings {
   productSource: ProductSource;
   manualRecipeId: string | null;
   timeouts: Timeouts;
+  historyDays: number;
 }
 
 export interface SimStatus {

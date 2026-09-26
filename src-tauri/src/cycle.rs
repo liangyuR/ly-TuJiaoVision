@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ly_plc::{now_ms, EdgeEvent, LinkState, PlcEngine};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -16,7 +16,9 @@ use crate::measure::{self, Job, Measured};
 use crate::plc::PlcHost;
 use crate::recipe::{self, Recipe, TriggerMode};
 use crate::settings::{CycleSettings, ProductSource};
+use crate::history;
 use crate::sim::{Scenario, SimCtl};
+use crate::store::{PartRecord, Store, VerdictCounts};
 
 pub enum Input {
     Edge(EdgeEvent),
@@ -39,7 +41,7 @@ pub enum Phase {
     Fault,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FrameStatus {
     Waiting,
@@ -49,7 +51,7 @@ pub enum FrameStatus {
     Missing,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameView {
     pub status: FrameStatus,
@@ -104,12 +106,19 @@ pub struct ResultView {
     pub judgement: Judgement,
 }
 
+/// 当日计数，跨天清零。
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Stats {
     pub total: u64,
     pub ok: u64,
     pub ng: u64,
     pub err: u64,
+}
+
+impl From<VerdictCounts> for Stats {
+    fn from(c: VerdictCounts) -> Self {
+        Self { total: c.ok + c.excursion + c.ng + c.err, ok: c.ok + c.excursion, ng: c.ng, err: c.err }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -222,6 +231,16 @@ impl CycleHost {
     }
 }
 
+/// 删除超过保留天数的检测记录。
+pub fn purge_history(app: &AppHandle) {
+    let days = host(app).settings().history_days.max(1) as i64;
+    match app.state::<Store>().purge_before(now_ms() - days * 86_400_000) {
+        Ok(n) if n > 0 => log(app, "info", "记录清理", format!("删除 {days} 天前的 {n} 条检测记录")),
+        Err(e) => log(app, "err", "记录清理", e),
+        _ => {}
+    }
+}
+
 fn plc(app: &AppHandle) -> &PlcEngine {
     app.state::<PlcHost>().inner().engine()
 }
@@ -305,6 +324,7 @@ struct Machine {
     ack_alarmed: bool,
     result: Option<ResultView>,
     stats: Stats,
+    stats_day: i64,
     stray: u64,
     stray_times: VecDeque<Instant>,
     alarms: Vec<String>,
@@ -313,6 +333,7 @@ struct Machine {
 
 impl Machine {
     fn new(app: AppHandle, measure_tx: UnboundedSender<Job>) -> Self {
+        let stats = app.state::<Store>().counts_since(history::local_midnight_ms()).map(Stats::from).unwrap_or_default();
         Self {
             app,
             measure_tx,
@@ -325,7 +346,8 @@ impl Machine {
             done_at: None,
             ack_alarmed: false,
             result: None,
-            stats: Stats::default(),
+            stats,
+            stats_day: history::local_day(),
             stray: 0,
             stray_times: VecDeque::new(),
             alarms: Vec::new(),
@@ -687,10 +709,49 @@ impl Machine {
         let fault = if judgement.fault_code > 0 { format!(" faultCode={}", judgement.fault_code) } else { String::new() };
         log(&app, level, "回写", format!("resultCode={}{fault} resultSn={sn} done↑ · {}", judgement.plc_code, judgement.reason));
         let drain_ms = self.part.as_ref().and_then(|p| p.end_at).map(|t| t.elapsed().as_millis() as u64);
+        self.record(sn, recipe_id.as_deref(), &judgement, drain_ms);
         self.result = Some(ResultView { sn, recipe_id, ts: now_ms(), drain_ms, judgement });
     }
 
+    fn record(&self, sn: u32, recipe_id: Option<&str>, judgement: &Judgement, drain_ms: Option<u64>) {
+        let part = self.part.as_ref().filter(|p| p.sn == sn);
+        let recipe = part.map(|p| p.recipe.clone()).or_else(|| recipe_id.and_then(|id| host(&self.app).recipe(id)));
+        let frames = part.map(|p| p.frames.clone()).unwrap_or_default();
+        let table = part.map(|p| p.table.clone()).filter(|t| t.iter().any(|x| *x != PointState::Pending));
+        let (received, triggers) = part.map_or((0, 0), |p| (p.received, p.triggers()));
+        let judgement = judgement.clone();
+        let app = self.app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let version = app.package_info().version.to_string();
+            let record = PartRecord {
+                ts: now_ms(),
+                sn,
+                recipe: recipe.as_deref(),
+                judgement: &judgement,
+                drain_ms,
+                frames: &frames,
+                frames_received: received,
+                triggers,
+                table: table.as_deref(),
+                software_version: &version,
+            };
+            match app.state::<Store>().insert(&record) {
+                Ok(id) => {
+                    let _ = app.emit("history://inserted", id);
+                }
+                Err(e) => log(&app, "err", "记录失败", e),
+            }
+        });
+    }
+
     fn count(&mut self, v: Verdict) {
+        let today = history::local_day();
+        if today != self.stats_day {
+            self.stats_day = today;
+            self.stats = Stats::default();
+            let app = self.app.clone();
+            tauri::async_runtime::spawn_blocking(move || purge_history(&app));
+        }
         self.stats.total += 1;
         match v {
             Verdict::Ok | Verdict::OkWithExcursion => self.stats.ok += 1,
@@ -705,6 +766,7 @@ impl Machine {
             let sn = self.part.as_ref().map_or(0, |p| p.sn);
             let judgement = Judgement::error(fault::DEVICE_LOST, format!("{reason}，结果未回写"));
             self.count(judgement.verdict);
+            self.record(sn, self.part.as_ref().map(|p| p.recipe.id.clone()).as_deref(), &judgement, None);
             log(&self.app, "err", "在途件中断", format!("SN {sn} 记 ERR 98，需人工处理该件"));
             self.result = Some(ResultView {
                 sn,

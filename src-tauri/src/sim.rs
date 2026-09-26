@@ -73,6 +73,7 @@ pub struct SimCtl {
     stop: AtomicBool,
     continuous: AtomicBool,
     parts: AtomicU32,
+    next_sn: AtomicU32,
     part_scenario: Mutex<Option<Scenario>>,
     message: Mutex<String>,
 }
@@ -119,7 +120,9 @@ async fn put(app: &AppHandle, t: &str, v: serde_json::Value) -> Result<(), Strin
 async fn run_part(app: &AppHandle, recipe: &Recipe, scenario: Scenario) -> Result<String, String> {
     let cycle = app.state::<CycleHost>();
     let n = recipe.shot_count();
-    let sn = (now_ms() / 1000 % 1_000_000_000) as u32;
+    let base = (now_ms() / 1000 % 1_000_000_000) as u32;
+    let _ = cycle.sim.next_sn.compare_exchange(0, base, Ordering::SeqCst, Ordering::SeqCst);
+    let sn = cycle.sim.next_sn.fetch_add(1, Ordering::SeqCst);
     *cycle.sim.part_scenario.lock().unwrap() = Some(scenario);
 
     let shot_count = if scenario == Scenario::CountMismatch { n - 1 } else { n };

@@ -12,6 +12,7 @@ const defaultSettings: CycleSettings = {
   productSource: "plc",
   manualRecipeId: null,
   timeouts: { armMs: 200, motionMs: 30000, drainMs: 1000, procMs: 3000, ackMs: 5000 },
+  historyDays: 180,
 };
 
 export const cycleApi = {
