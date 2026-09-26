@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { cameraApi, CameraConfigPanel, DryRunPanel, FeasibilityCalc, FramePreview, useCameraStatus, type CameraConfig } from "../features/camera";
+import { CalibPanel, cameraApi, CameraConfigPanel, DryRunPanel, FeasibilityCalc, FramePreview, useCameraStatus, type CameraConfig } from "../features/camera";
 import { SimControls } from "../features/cycle";
 
 export default function CameraPage() {
@@ -38,6 +38,7 @@ export default function CameraPage() {
         <FeasibilityCalc exposure={config?.exposureUs} fps={status?.maxFps} />
         <DryRunPanel frameMs={frameMs} />
         <FramePreview status={status} lastFrame={lastFrame} config={config} />
+        <CalibPanel isSim={!mvs} />
         <div className="panel">
           <h3 className="panel-title" style={{ marginBottom: 0 }}>模拟节拍</h3>
           <p className="muted">

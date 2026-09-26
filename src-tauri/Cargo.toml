@@ -19,4 +19,10 @@ tokio = { version = "1", features = ["sync", "time", "macros"] }
 libloading = "0.8"
 rusqlite = { version = "0.40", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# lyFlow feat/glue（ABI v12，图像域 + 涂胶飞拍积木）。合入 main 并推送后改成 git 依赖、固定提交号。
+lyflow-client = { path = "../../LyFlow-glue/crates/lyflow-client" }
 ly-plc = { git = "ssh://git@github.com/liangyuR/ly-plc.git", branch = "main" }
+
+# 模拟相机逐像素合成图像，未优化时一帧要一两秒，赶不上节拍
+[profile.dev.package.tujiao-vision]
+opt-level = 2

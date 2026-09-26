@@ -6,6 +6,7 @@ const labels: Record<FrameView["status"], [string, string]> = {
   measuring: ["测量", "c-acc"],
   done: ["完成", "c-ok"],
   locateFailed: ["定位失败", "c-err"],
+  error: ["测量出错", "c-err"],
   missing: ["未收到", "c-err"],
 };
 
@@ -19,6 +20,8 @@ function footer(f: FrameView) {
       return `${f.score?.toFixed(2)} · ${f.points} 点 · ${f.ms} ms`;
     case "locateFailed":
       return `分数 ${f.score?.toFixed(2)} < 0.60`;
+    case "error":
+      return "见事件日志";
     case "missing":
       return f.counterJump ? "帧计数跳号" : "未到达";
   }
@@ -31,7 +34,7 @@ export default function ShotStrip({ layout, part, vis }: { layout: Recipe; part:
       {layout.shots.map((_, k) => {
         const f = frames?.[k];
         const [label, tone] = labels[f?.status ?? "waiting"];
-        const bad = f && (f.status === "locateFailed" || f.status === "missing");
+        const bad = f && (f.status === "locateFailed" || f.status === "error" || f.status === "missing");
         return (
           <div key={k} className={`shot s-${f?.status ?? "waiting"}${f?.gapPoints ? " has-gap" : ""}`}>
             <div className="shot-head">

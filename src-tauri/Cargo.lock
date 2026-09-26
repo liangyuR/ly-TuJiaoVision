@@ -1845,6 +1845,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lyflow-client"
+version = "0.1.0"
+dependencies = [
+ "libloading 0.8.9",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "markup5ever"
 version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2796,6 +2805,7 @@ version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
 dependencies = [
+ "indexmap 2.14.2",
  "itoa",
  "memchr",
  "serde",
@@ -3761,6 +3771,7 @@ dependencies = [
  "chrono",
  "libloading 0.8.9",
  "ly-plc",
+ "lyflow-client",
  "rusqlite",
  "serde",
  "serde_json",

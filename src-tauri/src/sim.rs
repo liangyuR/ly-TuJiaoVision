@@ -11,7 +11,9 @@ use tokio::time::{sleep, Instant};
 use crate::cycle::CycleHost;
 use crate::inspection::{read_tag_u32, tag, tag_is_on, write_tag};
 use crate::plc::PlcHost;
+use crate::camera::SimRender;
 use crate::recipe::{Recipe, TriggerMode};
+use crate::simimage::PoseError;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -117,7 +119,7 @@ async fn put(app: &AppHandle, t: &str, v: serde_json::Value) -> Result<(), Strin
     write_tag(app.state::<PlcHost>().engine(), t, v).await
 }
 
-async fn run_part(app: &AppHandle, recipe: &Recipe, scenario: Scenario) -> Result<String, String> {
+async fn run_part(app: &AppHandle, recipe: &Arc<Recipe>, scenario: Scenario, vision: bool) -> Result<String, String> {
     let cycle = app.state::<CycleHost>();
     let n = recipe.shot_count();
     let base = (now_ms() / 1000 % 1_000_000_000) as u32;
@@ -140,9 +142,21 @@ async fn run_part(app: &AppHandle, recipe: &Recipe, scenario: Scenario) -> Resul
             TriggerMode::Stop => 1100,
         };
         let lost = scenario.lost_frame(n);
+        let locate_fail = scenario.locate_fail_frame(n);
+        // 机器人每件的定位偏差：±0.4 mm、±0.15°（模板定位要吸收它）
+        let r = |i: u32| ((sn.wrapping_mul(2_654_435_761).wrapping_add(i * 40_503) >> 8) % 1000) as f64 / 500.0 - 1.0;
+        let pose = PoseError { dx: 0.4 * r(1), dy: 0.4 * r(2), deg: 0.15 * r(3) };
         for k in 0..n {
             sleep(Duration::from_millis(interval)).await;
-            let _ = cycle.camera.trigger(lost == Some(k));
+            let render = vision.then(|| SimRender {
+                recipe: recipe.clone(),
+                k,
+                scenario,
+                // 定位失败场景：这一帧斜着偏开 15 mm，超出模板搜索范围，也没有哪条直边还能对上
+                pose: if locate_fail == Some(k) { PoseError { dx: pose.dx + 15.0, dy: pose.dy + 15.0, ..pose } } else { pose },
+                seed: sn as u64 * 16 + k as u64,
+            });
+            let _ = cycle.camera.trigger(lost == Some(k), render);
         }
         sleep(Duration::from_millis(300)).await;
         put(app, tag::PART_END, json!(true)).await?;
@@ -168,8 +182,18 @@ pub async fn run(app: AppHandle, recipe: Arc<Recipe>, scenario: Scenario, contin
     loop {
         seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
         let s = scenario.resolve(seed >> 8);
-        sim.set_message(&app, format!("运行中：{}", recipe.id));
-        let result = run_part(&app, &recipe, s).await;
+        let vision = crate::vision::enabled(&app);
+        if vision {
+            sim.set_message(&app, format!("准备 {} 的模拟示教资料…", recipe.id));
+            let (a, r) = (app.clone(), recipe.clone());
+            let prepared = tauri::async_runtime::spawn_blocking(move || crate::vision::assets_for(&a, &r).map(|_| ())).await;
+            if let Ok(Err(e)) | Err(e) = prepared.map_err(|e| e.to_string()) {
+                sim.set_message(&app, format!("已中止：{e}"));
+                break;
+            }
+        }
+        sim.set_message(&app, format!("运行中：{}{}", recipe.id, if vision { "（lyFlow 测量）" } else { "" }));
+        let result = run_part(&app, &recipe, s, vision).await;
         *sim.part_scenario.lock().unwrap() = None;
         sim.parts.fetch_add(1, Ordering::SeqCst);
         match result {

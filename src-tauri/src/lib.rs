@@ -1,7 +1,6 @@
 mod camera;
 mod commands;
 mod cycle;
-mod detection;
 mod history;
 mod inspection;
 mod judge;
@@ -11,7 +10,9 @@ mod plc;
 mod recipe;
 mod settings;
 mod sim;
+mod simimage;
 mod store;
+mod vision;
 
 use tauri::Manager;
 
@@ -23,13 +24,17 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             app.manage(open_store(app)?);
+            app.manage(vision::VisionHost::default());
             app.manage(cycle::CycleHost::init(app.handle())?);
             app.manage(plc::PlcHost::init(app.handle())?);
             plc::PlcHost::start_if_configured(app.handle());
             cycle::CycleHost::start(app.handle());
             camera::CameraHost::start(app.handle());
             let handle = app.handle().clone();
-            tauri::async_runtime::spawn_blocking(move || cycle::purge_history(&handle));
+            tauri::async_runtime::spawn_blocking(move || {
+                cycle::purge_history(&handle);
+                vision::apply_settings(&handle);
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -69,6 +74,8 @@ pub fn run() {
             history::history_rejudge,
             history::history_export,
             history::reveal_path,
+            vision::vision_calib_info,
+            vision::vision_calibrate,
             sim::sim_status,
             sim::sim_start,
             sim::sim_stop,

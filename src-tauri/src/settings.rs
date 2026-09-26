@@ -51,11 +51,22 @@ pub struct CycleSettings {
     pub manual_recipe_id: Option<String>,
     pub timeouts: Timeouts,
     pub history_days: u32,
+    /// lyFlow 核心库（lyflow_core.dll）路径
+    pub lyflow_core: Option<String>,
+    /// 用 lyFlow 流程测量（定位 + 逐点卡尺）；关闭时用模拟测量
+    pub vision: bool,
 }
 
 impl Default for CycleSettings {
     fn default() -> Self {
-        Self { product_source: ProductSource::Plc, manual_recipe_id: None, timeouts: Timeouts::default(), history_days: 180 }
+        Self {
+            product_source: ProductSource::Plc,
+            manual_recipe_id: None,
+            timeouts: Timeouts::default(),
+            history_days: 180,
+            lyflow_core: std::env::var("LYFLOW_CORE_DLL").ok(),
+            vision: false,
+        }
     }
 }
 

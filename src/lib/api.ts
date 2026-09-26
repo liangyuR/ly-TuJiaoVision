@@ -9,6 +9,9 @@ export interface EngineStatus {
   backend: string;
   ready: boolean;
   message: string;
+  version?: string | null;
+  path?: string | null;
+  measuring?: boolean;
 }
 
 export async function getAppInfo(): Promise<AppInfo> {

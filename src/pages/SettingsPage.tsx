@@ -97,18 +97,77 @@ function CycleSettingsPanel() {
   );
 }
 
+function VisionPanel() {
+  const [settings, setSettings] = useState<CycleSettings | null>(null);
+  const [engine, setEngine] = useState<EngineStatus | null>(null);
+  const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null);
+  const refresh = () => getEngineStatus().then(setEngine).catch(() => setEngine(null));
+
+  useEffect(() => {
+    cycleApi.getSettings().then(setSettings);
+    refresh();
+  }, []);
+  if (!settings) return null;
+
+  const save = async () => {
+    try {
+      await cycleApi.saveSettings(settings);
+      setNotice({ ok: true, text: "已保存" });
+    } catch (e) {
+      setNotice({ ok: false, text: String(e) });
+    }
+    refresh();
+  };
+
+  return (
+    <div className="panel">
+      <div className="panel-toolbar">
+        <h3 className="panel-title">视觉测量（lyFlow）</h3>
+        <button className="btn primary" onClick={save}>保存</button>
+      </div>
+      <div className="form-grid">
+        <label className="field span-2">
+          <span>核心库路径（lyflow_core.dll）</span>
+          <input
+            id="lyflow-core"
+            className="input mono"
+            placeholder="例如 D:\project\LyFlow-glueuild\corein\lyflow_core.dll"
+            value={settings.lyflowCore ?? ""}
+            onChange={(e) => setSettings({ ...settings, lyflowCore: e.target.value || null })}
+          />
+        </label>
+        <label className="check" style={{ alignSelf: "end", height: 32 }}>
+          <input id="vision-on" type="checkbox" checked={settings.vision} onChange={(e) => setSettings({ ...settings, vision: e.target.checked })} />
+          用 lyFlow 测量（定位 + 逐点卡尺）
+        </label>
+      </div>
+      <dl className="kv" style={{ marginTop: 12 }}>
+        <dt>状态</dt>
+        <dd className={engine?.ready ? "ok" : "muted"}>
+          {engine ? `${engine.ready ? "已加载" : "未加载"}${engine.version ? ` · ${engine.version}` : ""}` : "--"}
+        </dd>
+        <dt>说明</dt>
+        <dd>{engine?.message ?? "--"}</dd>
+      </dl>
+      <p className="muted hint">
+        关闭时用模拟测量。打开后，模拟相机按配方几何合成图像并自动生成示教资料；海康相机需要先示教配方、再在图像源页做工位标定。
+      </p>
+      {notice && <div className={`notice ${notice.ok ? "ok" : "error"}`}>{notice.text}</div>}
+    </div>
+  );
+}
+
 export default function SettingsPage() {
   const [info, setInfo] = useState<AppInfo | null>(null);
-  const [engine, setEngine] = useState<EngineStatus | null>(null);
 
   useEffect(() => {
     getAppInfo().then(setInfo).catch(() => setInfo(null));
-    getEngineStatus().then(setEngine).catch(() => setEngine(null));
   }, []);
 
   return (
     <div className="stack">
       <CycleSettingsPanel />
+      <VisionPanel />
       <div className="panel">
         <h3 className="panel-title">关于</h3>
         <dl className="kv">
@@ -116,17 +175,6 @@ export default function SettingsPage() {
           <dd>{info?.name ?? "--"}</dd>
           <dt>版本</dt>
           <dd>{info?.version ?? "--"}</dd>
-        </dl>
-      </div>
-      <div className="panel">
-        <h3 className="panel-title">检测引擎</h3>
-        <dl className="kv">
-          <dt>后端</dt>
-          <dd>{engine?.backend ?? "--"}</dd>
-          <dt>状态</dt>
-          <dd>{engine ? (engine.ready ? "就绪" : "未就绪") : "--"}</dd>
-          <dt>说明</dt>
-          <dd>{engine?.message ?? "--"}</dd>
         </dl>
       </div>
     </div>

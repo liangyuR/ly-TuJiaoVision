@@ -1,7 +1,7 @@
 import type { CameraStatus } from "../camera/types";
 
 export type Phase = "IDLE" | "VALIDATE" | "ACQUIRE" | "DRAIN" | "JUDGE" | "REPORT" | "RELEASE" | "FAULT";
-export type FrameStatus = "waiting" | "measuring" | "done" | "locateFailed" | "missing";
+export type FrameStatus = "waiting" | "measuring" | "done" | "locateFailed" | "error" | "missing";
 export type Verdict = "OK" | "OK_WITH_EXCURSION" | "NG_POSITION" | "NG_ABSOLUTE" | "NG_GAP" | "ERR_INSPECT";
 export type TriggerMode = "fly" | "stop";
 export type ProductSource = "plc" | "manual";
@@ -152,6 +152,8 @@ export interface CycleSettings {
   manualRecipeId: string | null;
   timeouts: Timeouts;
   historyDays: number;
+  lyflowCore: string | null;
+  vision: boolean;
 }
 
 export interface SimStatus {

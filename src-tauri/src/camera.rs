@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{c_uint, c_void};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,6 +12,10 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::cycle::{self, CycleHost, Input, Phase};
 use crate::mvs::{self, DeviceSummary, FrameInfo};
+use crate::recipe::Recipe;
+use crate::sim::Scenario;
+use crate::simimage::{self, PoseError};
+use crate::vision::FrameImage;
 
 /// 一帧图像的元数据。计数器取自相机 Chunk（帧计数、Line0 触发计数），未开启 Chunk 时退化为 SDK 帧号。
 #[derive(Clone, Debug, Serialize)]
@@ -21,6 +25,25 @@ pub struct Frame {
     pub trigger_counter: u64,
     pub lost_packets: u32,
     pub ts: i64,
+    /// 整帧 Mono8 像素。只在启用 lyFlow 测量时带上（取图回调里拷一份，模拟相机合成）。
+    #[serde(skip)]
+    pub image: Option<Arc<FrameImage>>,
+}
+
+/// 模拟相机合成图像所需的信息：哪个配方的第几个拍照点、什么场景、机器人偏差。
+pub struct SimRender {
+    pub recipe: Arc<Recipe>,
+    pub k: usize,
+    pub scenario: Scenario,
+    pub pose: PoseError,
+    pub seed: u64,
+}
+
+/// 模拟帧并行合成、按帧计数顺序交付：节拍按帧计数的先后推 k，乱序会让后面的帧落错拍照点。
+#[derive(Default)]
+struct Reorder {
+    next: u64,
+    pending: BTreeMap<u64, Option<Frame>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,10 +148,32 @@ struct Shared {
     preview: Mutex<Option<Preview>>,
     dry_run: Mutex<Option<(Instant, Vec<DryFrame>)>>,
     disconnected: AtomicBool,
+    capture_full: AtomicBool,
+    last_full: Mutex<Option<Arc<FrameImage>>>,
+    order: Mutex<Reorder>,
 }
 
 impl Shared {
+    fn deliver_in_order(&self, seq: u64, frame: Option<Frame>) {
+        let mut order = self.order.lock().unwrap();
+        if order.next == 0 {
+            order.next = 1;
+        }
+        order.pending.insert(seq, frame);
+        loop {
+            let next = order.next;
+            let Some(f) = order.pending.remove(&next) else { break };
+            order.next += 1;
+            if let Some(f) = f {
+                self.deliver(f);
+            }
+        }
+    }
+
     fn deliver(&self, frame: Frame) {
+        if let Some(img) = &frame.image {
+            *self.last_full.lock().unwrap() = Some(img.clone());
+        }
         self.frames.fetch_add(1, Ordering::Relaxed);
         self.lost_packets.fetch_add(frame.lost_packets as u64, Ordering::Relaxed);
         {
@@ -185,7 +230,13 @@ extern "system" fn on_image(data: *mut u8, info: *mut FrameInfo, user: *mut c_vo
             }
             *shared.preview.lock().unwrap() = Some(Preview { width: pw as u32, height: ph as u32, data: out });
         }
-        shared.deliver(Frame { frame_counter, trigger_counter, lost_packets: info.lost_packet, ts: now_ms() });
+        let image = (shared.capture_full.load(Ordering::Relaxed) && info.pixel_type == mvs::PIXEL_MONO8 && !data.is_null()).then(|| {
+            let w = if info.extend_width != 0 { info.extend_width } else { info.width as u32 };
+            let h = if info.extend_height != 0 { info.extend_height } else { info.height as u32 };
+            let pixels = unsafe { std::slice::from_raw_parts(data, (w * h) as usize) }.to_vec();
+            Arc::new(FrameImage { width: w, height: h, pixels })
+        });
+        shared.deliver(Frame { frame_counter, trigger_counter, lost_packets: info.lost_packet, ts: now_ms(), image });
     }));
 }
 
@@ -226,6 +277,9 @@ impl CameraHost {
                 preview: Mutex::new(None),
                 dry_run: Mutex::new(None),
                 disconnected: AtomicBool::new(false),
+                capture_full: AtomicBool::new(false),
+                last_full: Mutex::new(None),
+                order: Mutex::new(Reorder::default()),
             }),
             config: Mutex::new(CameraConfig::load(&config_path)),
             config_path,
@@ -265,21 +319,47 @@ impl CameraHost {
         }
     }
 
+    /// 取图回调是否拷贝整帧（启用 lyFlow 测量时打开）。
+    pub fn set_capture_full(&self, on: bool) {
+        self.shared.capture_full.store(on, Ordering::Relaxed);
+    }
+
+    /// 最近一帧的整幅图像（标定用）。
+    pub fn last_full(&self) -> Option<Arc<FrameImage>> {
+        self.shared.last_full.lock().unwrap().clone()
+    }
+
     /// Line0 上升沿（模拟相机）或软触发（MVS 且触发源为 Software）。返回是否实际发出了触发。
     /// `lose_in_transfer` 仅模拟相机使用：相机已曝光但帧在传输中丢失，主机侧表现为帧计数跳号。
-    pub fn trigger(&self, lose_in_transfer: bool) -> bool {
+    /// `render` 给了时模拟相机合成这一帧的图像（交付不早于 180 ms 的传输时间）。
+    pub fn trigger(&self, lose_in_transfer: bool, render: Option<SimRender>) -> bool {
         let config = self.config();
         match config.source {
             CameraSource::Sim => {
                 let trigger_counter = self.sim_triggers.fetch_add(1, Ordering::SeqCst) + 1;
                 let frame_counter = self.sim_frames.fetch_add(1, Ordering::SeqCst) + 1;
-                if !lose_in_transfer {
-                    let shared = self.shared.clone();
-                    tauri::async_runtime::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(180)).await;
-                        shared.deliver(Frame { frame_counter, trigger_counter, lost_packets: 0, ts: now_ms() });
-                    });
+                let shared = self.shared.clone();
+                if lose_in_transfer {
+                    shared.deliver_in_order(frame_counter, None);
+                    return true;
                 }
+                tauri::async_runtime::spawn(async move {
+                    let started = Instant::now();
+                    let image = match render {
+                        Some(r) => tauri::async_runtime::spawn_blocking(move || {
+                            Arc::new(simimage::render(&r.recipe, r.k, r.scenario, r.pose, r.seed))
+                        })
+                        .await
+                        .ok(),
+                        None => None,
+                    };
+                    let transfer = Duration::from_millis(180);
+                    if started.elapsed() < transfer {
+                        tokio::time::sleep(transfer - started.elapsed()).await;
+                    }
+                    let frame = Frame { frame_counter, trigger_counter, lost_packets: 0, ts: now_ms(), image };
+                    shared.deliver_in_order(frame_counter, Some(frame));
+                });
                 true
             }
             CameraSource::Mvs => {
@@ -467,7 +547,7 @@ pub fn camera_soft_trigger(cycle: State<'_, CycleHost>) -> Result<(), String> {
     if cycle.camera.config().trigger_source != "Software" {
         return Err("触发源为 Line0，软触发前先把触发源改为 Software".into());
     }
-    if cycle.camera.trigger(false) {
+    if cycle.camera.trigger(false, None) {
         Ok(())
     } else {
         Err("相机未连接".into())

@@ -48,6 +48,8 @@ pub enum FrameStatus {
     Measuring,
     Done,
     LocateFailed,
+    /// 测量本身没做成（lyFlow 运行失败、缺示教资料等）
+    Error,
     Missing,
 }
 
@@ -199,7 +201,7 @@ impl CycleHost {
     pub fn start(app: &AppHandle) {
         let host = app.state::<CycleHost>();
         let Some(mut rx) = host.rx.lock().unwrap().take() else { return };
-        let mut machine = Machine::new(app.clone(), measure::spawn_worker(host.tx.clone()));
+        let mut machine = Machine::new(app.clone(), measure::spawn_worker(app.clone(), host.tx.clone()));
         tauri::async_runtime::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(20));
             machine.publish();
@@ -226,7 +228,7 @@ impl CycleHost {
         self.recipes.iter().find(|r| r.id == id).cloned()
     }
 
-    fn settings(&self) -> CycleSettings {
+    pub fn settings(&self) -> CycleSettings {
         self.shared.lock().unwrap().settings.clone()
     }
 }
@@ -549,7 +551,7 @@ impl Machine {
         };
         part.measuring_since[k] = Some(Instant::now());
         part.queue += 1;
-        let _ = self.measure_tx.send(Job { sn: part.sn, k, recipe: part.recipe.clone(), scenario: part.scenario });
+        let _ = self.measure_tx.send(Job { sn: part.sn, k, recipe: part.recipe.clone(), scenario: part.scenario, image: f.image.clone() });
         let lost = if f.lost_packets > 0 { format!(" · 丢包 {}", f.lost_packets) } else { String::new() };
         let msg = format!(
             "k={k} · Chunk 帧 {} 触发 {}{}{lost}",
@@ -572,12 +574,25 @@ impl Machine {
             part.table[j as usize] = m.point_state(i);
         }
         let gaps = m.st.iter().filter(|&&s| s == measure::ST_GAP).count();
-        frame.status = if m.located { FrameStatus::Done } else { FrameStatus::LocateFailed };
-        frame.score = Some(m.score);
+        frame.status = if m.error.is_some() {
+            FrameStatus::Error
+        } else if m.located {
+            FrameStatus::Done
+        } else {
+            FrameStatus::LocateFailed
+        };
+        frame.score = (m.error.is_none()).then_some(m.score);
         frame.points = m.idx.len();
         frame.gap_points = gaps;
         frame.ms = Some(m.ms);
-        let (level, ev, msg) = if m.located {
+        if let Some(e) = &m.error {
+            if part.fault.is_none() {
+                part.fault = Some((fault::PROCESS_TIMEOUT, format!("帧 k={} 测量出错：{e}", m.k)));
+            }
+        }
+        let (level, ev, msg) = if let Some(e) = &m.error {
+            ("err", "测量出错", format!("k={} · {e}", m.k))
+        } else if m.located {
             let extra = if gaps > 0 { format!(" · 缺胶 {gaps} 点") } else { String::new() };
             (if gaps > 0 { "ng" } else { "info" }, "测量完成", format!("k={} 分数 {:.2} · {} 点 · {} ms{extra}", m.k, m.score, m.idx.len(), m.ms))
         } else {
@@ -861,7 +876,7 @@ pub fn cycle_get_settings(cycle: State<'_, CycleHost>) -> CycleSettings {
 }
 
 #[tauri::command]
-pub fn cycle_save_settings(cycle: State<'_, CycleHost>, settings: CycleSettings) -> Result<(), String> {
+pub fn cycle_save_settings(app: AppHandle, cycle: State<'_, CycleHost>, settings: CycleSettings) -> Result<(), String> {
     settings.validate()?;
     if let Some(id) = &settings.manual_recipe_id {
         cycle.recipe(id).ok_or("配方不存在")?;
@@ -869,6 +884,7 @@ pub fn cycle_save_settings(cycle: State<'_, CycleHost>, settings: CycleSettings)
     settings.save(&cycle.settings_path)?;
     cycle.shared.lock().unwrap().settings = settings;
     let _ = cycle.tx.send(Input::Refresh);
+    tauri::async_runtime::spawn_blocking(move || crate::vision::apply_settings(&app));
     Ok(())
 }
 

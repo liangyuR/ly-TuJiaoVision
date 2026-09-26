@@ -9,6 +9,7 @@ const frameStatus: Record<string, [string, string]> = {
   measuring: ["未完成", "c-err"],
   done: ["正常", "c-ok"],
   locateFailed: ["定位失败", "c-err"],
+  error: ["测量出错", "c-err"],
   missing: ["未收到", "c-err"],
 };
 
