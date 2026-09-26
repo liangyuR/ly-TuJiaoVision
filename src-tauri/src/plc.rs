@@ -9,6 +9,7 @@ use ly_plc::{
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use crate::cycle::{CycleHost, Input};
 use crate::inspection;
 
 pub struct PlcHost {
@@ -34,11 +35,17 @@ impl PlcHost {
             }
             PlcEvent::Edge(e) => {
                 let _ = handle.emit("plc://edge", &e);
-                inspection::on_plc_edge(&handle, &e);
+                if let Some(cycle) = handle.try_state::<CycleHost>() {
+                    let _ = cycle.tx.send(Input::Edge(e));
+                }
             }
         });
         let logbook = Arc::new(Logbook::open(&log_path, sink.clone(), config.log_retention_days)?);
         Ok(Self { engine: PlcEngine::new(config, logbook, sink), config_path })
+    }
+
+    pub fn engine(&self) -> &PlcEngine {
+        &self.engine
     }
 
     pub fn start_if_configured(app: &AppHandle) {

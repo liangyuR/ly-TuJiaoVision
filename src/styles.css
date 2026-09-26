@@ -10,6 +10,7 @@
   --ok: #22c55e;
   --ng: #ef4444;
   --warn: #f59e0b;
+  --err: #a78bfa;
   --radius: 8px;
   --sidebar-w: 220px;
   --sidebar-w-collapsed: 64px;
@@ -68,6 +69,20 @@ h1, h3, p { margin: 0; }
 .nav-item:hover { background: rgba(255, 255, 255, 0.04); color: var(--text); }
 .nav-item.active { background: var(--accent-soft); color: var(--accent); }
 .sidebar.collapsed .nav-item { justify-content: center; padding: 0; }
+
+.nav-group { display: flex; flex-direction: column; gap: 4px; }
+.nav-group-label {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 40px;
+  padding: 0 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.sidebar.collapsed .nav-group-label { justify-content: center; padding: 0; }
+.nav-subitem { padding-left: 40px; height: 34px; }
+.sidebar.collapsed .nav-subitem { padding-left: 0; }
 
 .sidebar-footer {
   display: flex;
@@ -163,31 +178,6 @@ h1, h3, p { margin: 0; }
   color: var(--text-muted);
 }
 .empty.small { padding: 28px 0; border: 1px dashed var(--border); border-radius: 6px; }
-
-.inspect { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px; height: 100%; }
-.viewer { display: flex; flex-direction: column; min-height: 0; }
-.viewer-canvas {
-  flex: 1;
-  min-height: 0;
-  display: grid;
-  place-items: center;
-  border-radius: 6px;
-  background-color: #060b16;
-  background-image: linear-gradient(var(--border) 1px, transparent 1px), linear-gradient(90deg, var(--border) 1px, transparent 1px);
-  background-size: 40px 40px;
-  background-position: center;
-}
-.inspect-side { display: flex; flex-direction: column; gap: 16px; min-height: 0; }
-.verdict { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 20px; }
-.verdict strong { font-size: 40px; letter-spacing: 2px; }
-.verdict-label { font-size: 12px; color: var(--text-muted); }
-.verdict.pass strong { color: var(--ok); }
-.verdict.fail strong { color: var(--ng); }
-.verdict.idle strong { color: var(--text-muted); }
-.metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-.metric { display: flex; flex-direction: column; gap: 4px; padding: 10px; border-radius: 6px; background: var(--bg-elev); }
-.metric span { font-size: 12px; }
-.metric strong { font-size: 18px; font-variant-numeric: tabular-nums; }
 
 .form-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 14px; }
 .field { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--text-muted); }
