@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { NavLink } from "react-router-dom";
 import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
-import { navItems } from "./nav";
+import { isNavGroup, navEntries } from "./nav";
 import { getEngineStatus, type EngineStatus } from "../lib/api";
 import { linkStateLabels, usePlcStatus } from "../features/plc";
 
@@ -28,17 +28,36 @@ export default function Sidebar() {
       </div>
 
       <nav className="sidebar-nav">
-        {navItems.map(({ path, label, icon: Icon }) => (
-          <NavLink
-            key={path}
-            to={path}
-            title={collapsed ? label : undefined}
-            className={({ isActive }) => `nav-item${isActive ? " active" : ""}`}
-          >
-            <Icon size={18} />
-            {!collapsed && <span>{label}</span>}
-          </NavLink>
-        ))}
+        {navEntries.map((entry) =>
+          isNavGroup(entry) ? (
+            <div className="nav-group" key={entry.label}>
+              <div className="nav-group-label" title={collapsed ? entry.label : undefined}>
+                <entry.icon size={18} />
+                {!collapsed && <span>{entry.label}</span>}
+              </div>
+              {entry.children.map(({ path, label }) => (
+                <NavLink
+                  key={path}
+                  to={path}
+                  title={collapsed ? label : undefined}
+                  className={({ isActive }) => `nav-item nav-subitem${isActive ? " active" : ""}`}
+                >
+                  {!collapsed && <span>{label}</span>}
+                </NavLink>
+              ))}
+            </div>
+          ) : (
+            <NavLink
+              key={entry.path}
+              to={entry.path}
+              title={collapsed ? entry.label : undefined}
+              className={({ isActive }) => `nav-item${isActive ? " active" : ""}`}
+            >
+              <entry.icon size={18} />
+              {!collapsed && <span>{entry.label}</span>}
+            </NavLink>
+          )
+        )}
       </nav>
 
       <div className="sidebar-footer">

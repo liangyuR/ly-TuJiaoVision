@@ -14,12 +14,32 @@ export interface NavItem {
   element: ComponentType;
 }
 
-export const navItems: NavItem[] = [
+export interface NavGroup {
+  label: string;
+  icon: LucideIcon;
+  children: NavItem[];
+}
+
+export type NavEntry = NavItem | NavGroup;
+
+export function isNavGroup(entry: NavEntry): entry is NavGroup {
+  return "children" in entry;
+}
+
+export const navEntries: NavEntry[] = [
   { path: "/inspect", label: "实时检测", icon: ScanEye, element: InspectPage },
   { path: "/camera", label: "图像源", icon: Camera, element: CameraPage },
-  { path: "/plc", label: "PLC 通讯", icon: Cable, element: PlcSettingsPage },
-  { path: "/plc-logs", label: "PLC 日志", icon: ScrollText, element: PlcLogsPage },
+  {
+    label: "PLC",
+    icon: Cable,
+    children: [
+      { path: "/plc", label: "通讯", icon: Cable, element: PlcSettingsPage },
+      { path: "/plc-logs", label: "日志", icon: ScrollText, element: PlcLogsPage },
+    ],
+  },
   { path: "/recipe", label: "检测配方", icon: SlidersHorizontal, element: RecipePage },
   { path: "/history", label: "历史记录", icon: History, element: HistoryPage },
   { path: "/settings", label: "系统设置", icon: Settings, element: SettingsPage },
 ];
+
+export const navItems: NavItem[] = navEntries.flatMap((entry) => (isNavGroup(entry) ? entry.children : [entry]));
