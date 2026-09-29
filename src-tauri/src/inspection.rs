@@ -16,6 +16,8 @@ pub mod tag {
     pub const RESULT_CODE: &str = "resultCode";
     pub const FAULT_CODE: &str = "faultCode";
     pub const RESULT_SN: &str = "resultSn";
+    /// 随动：机器人已走过的胶路弧长（按配方里的换算系数转成 mm）
+    pub const PATH_PROGRESS: &str = "pathProgress";
 }
 
 fn point_id(engine: &PlcEngine, tag: &str) -> Option<String> {
@@ -29,6 +31,18 @@ pub fn read_tag(engine: &PlcEngine, tag: &str) -> Option<PlcValue> {
 
 pub fn tag_is_on(engine: &PlcEngine, tag: &str) -> bool {
     read_tag(engine, tag).is_some_and(|v| v.is_truthy())
+}
+
+/// 标签的数值与读到它的轮询时刻（ms）。
+pub fn read_tag_f32_ts(engine: &PlcEngine, tag: &str) -> Option<(f32, i64)> {
+    let id = point_id(engine, tag)?;
+    let v = engine.values().get(&id)?.clone();
+    let x = match v.value? {
+        PlcValue::Int(i) => i as f32,
+        PlcValue::Float(f) => f as f32,
+        PlcValue::Bool(b) => b as u8 as f32,
+    };
+    Some((x, v.ts))
 }
 
 pub fn read_tag_u32(engine: &PlcEngine, tag: &str) -> Option<u32> {
@@ -69,6 +83,7 @@ pub fn default_plc_config() -> PlcConfig {
             point("p_part_sn", "工件序列号", "HR100", U32, NoEdge, tag::PART_SN),
             point("p_product_code", "产品代码", "HR102", U16, NoEdge, tag::PRODUCT_CODE),
             point("p_shot_count", "计划拍照点数", "HR103", U16, NoEdge, tag::SHOT_COUNT),
+            PlcPoint { log_changes: false, ..point("p_path_progress", "随动进度（0.1 mm）", "HR104", U32, NoEdge, tag::PATH_PROGRESS) },
             point("p_vision_ready", "视觉就绪", "C20", Bool, NoEdge, tag::VISION_READY),
             point("p_armed", "已布防", "C21", Bool, NoEdge, tag::ARMED),
             point("p_busy", "检测中", "C22", Bool, NoEdge, tag::BUSY),

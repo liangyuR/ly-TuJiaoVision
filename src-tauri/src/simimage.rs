@@ -183,7 +183,7 @@ pub fn render(recipe: &Recipe, k: usize, scenario: Scenario, pose: PoseError, se
             });
         }
     });
-    FrameImage { width: w, height: h, pixels }
+    FrameImage::new(w, h, pixels)
 }
 
 fn write_pgm(path: &Path, img: &FrameImage, x: u32, y: u32, w: u32, h: u32) -> Result<(), String> {

@@ -13,24 +13,14 @@ use tauri::{AppHandle, Manager};
 
 use crate::camera::CameraSource;
 use crate::cycle::CycleHost;
+pub use crate::frame::FrameImage;
+use crate::measure::{Job, JobKind, Measured, Measurer, ST_GAP, ST_INVALID, ST_OK};
 use crate::recipe::Recipe;
 use crate::simimage;
 
 /// 与 LyFlow packs/glue/graphs/flyshot.lyflow.json 同一份；本程序固定用它。
 pub const FLYSHOT_GRAPH: &str = include_str!("../resources/flyshot.lyflow.json");
 
-/// 一帧 8 位灰度图，行主序、无行填充。
-pub struct FrameImage {
-    pub width: u32,
-    pub height: u32,
-    pub pixels: Vec<u8>,
-}
-
-impl std::fmt::Debug for FrameImage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FrameImage({}×{})", self.width, self.height)
-    }
-}
 
 /// lyFlow main 的 C ABI 只能注入点云；glue 分支的 RunImageInput 合入后删掉这个开关，恢复逐帧注图。
 const IMAGE_INPUT_UNSUPPORTED: bool = true;
@@ -75,6 +65,55 @@ impl Engine {
 pub struct RunResult {
     pub summary: Value,
     pub outputs: Value,
+}
+
+/// lyFlow 飞拍流程（定位 + 逐点卡尺）作为测量后端。
+pub struct LyFlowMeasurer {
+    pub app: AppHandle,
+}
+
+impl Measurer for LyFlowMeasurer {
+    fn measure(&self, job: &Job, image: &FrameImage) -> Result<Measured, String> {
+        let JobKind::Shot { k } = job.kind else {
+            return Err("lyFlow 流程目前只有飞拍版本；随动配方请在系统设置里改用本程序卡尺".into());
+        };
+        let app = &self.app;
+        let settings = app.state::<CycleHost>().settings();
+        let engine = app.state::<VisionHost>().engine(settings.lyflow_core.as_deref()).ok_or("lyFlow 核心库未加载")?;
+        let assets = assets_for(app, &job.recipe)?;
+        if !assets.calib.exists() {
+            return Err("工位未标定：先在图像源页用标定板标定".into());
+        }
+        let params = assets.params(k).ok_or_else(|| format!("拍照点 k={k} 没有示教资料"))?;
+        let base = assets.calib.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let run_id = format!("{}-k{k}-{}", job.sn, ly_plc::now_ms());
+        let r = engine.run(FLYSHOT_GRAPH, &run_id, &base, image, &params)?;
+        if r.status() == "failed" {
+            return Err(r.failure());
+        }
+        let pose: Pose = r.record("pose").and_then(|v| serde_json::from_value(v.clone()).ok()).ok_or("图没有输出 pose")?;
+        let sm: StationMeasure = r.record("measure").and_then(|v| serde_json::from_value(v.clone()).ok()).ok_or("图没有输出 measure")?;
+        if sm.unit != "mm" {
+            return Err(format!("测量单位是 {}，标定文件不是毫米", sm.unit));
+        }
+        let mut m = Measured { located: pose.ok, score: pose.score as f32, ..Measured::empty(job) };
+        for (i, id) in sm.ids.iter().enumerate() {
+            let Some(j) = id.as_u64() else { continue };
+            let (d, st) = match sm.status[i].as_str() {
+                "ok" => match sm.inner_center[i] {
+                    Some(d) => (d as f32, ST_OK),
+                    None => (0.0, ST_INVALID),
+                },
+                "no_bead" => (0.0, ST_GAP),
+                _ => (0.0, ST_INVALID),
+            };
+            m.idx.push(j as u32);
+            m.d.push(d);
+            m.w.push(f32::NAN);
+            m.st.push(st);
+        }
+        Ok(m)
+    }
 }
 
 impl RunResult {
@@ -147,7 +186,7 @@ pub struct VisionAssets {
 
 impl VisionAssets {
     pub fn params(&self, k: usize) -> Option<Value> {
-        let s = self.shots.get(k)?;
+        let s = self.shots.get(k).filter(|s| !s.template.as_os_str().is_empty())?;
         let p = |p: &Path| p.to_string_lossy().replace('\\', "/");
         Some(json!({
             "template": p(&s.template),
@@ -229,17 +268,25 @@ impl VisionHost {
     pub fn set_assets(&self, key: String, assets: Arc<VisionAssets>) {
         self.assets.lock().unwrap().insert(key, assets);
     }
+
+    /// 重新示教后丢掉该配方的缓存。
+    pub fn forget(&self, recipe_id: &str) {
+        self.assets.lock().unwrap().retain(|k, _| !k.contains(&format!(":{recipe_id}:")));
+    }
 }
 
 /// 工位标定文件（标定属于相机工位，换型不重标）。
-pub fn station_calib_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(app.path().app_config_dir().map_err(|e| e.to_string())?.join("calib").join("plane_calib.json"))
+pub fn station_calib_path(app: &AppHandle, cam: u8) -> Result<PathBuf, String> {
+    // 第 1 台沿用单相机时代的文件名
+    let name = if cam == 0 { "plane_calib.json".to_string() } else { format!("plane_calib_cam{}.json", cam + 1) };
+    Ok(app.path().app_config_dir().map_err(|e| e.to_string())?.join("calib").join(name))
 }
 
 /// 配方在当前相机下的视觉资料。模拟相机按名义几何自动生成（按配方哈希缓存）；
 /// 真实相机用示教向导的产物，标定取工位标定文件。
 pub fn assets_for(app: &AppHandle, recipe: &Recipe) -> Result<Arc<VisionAssets>, String> {
-    let source = app.state::<CycleHost>().camera.config().source;
+    let slot = app.state::<CycleHost>().camera.slot(recipe.camera as usize).ok_or("配方用的相机不在相机组里")?;
+    let source = slot.config().source;
     let host = app.state::<VisionHost>();
     let key = format!("{source:?}:{}:{}", recipe.id, recipe.hash);
     if let Some(a) = host.assets(&key) {
@@ -253,6 +300,9 @@ pub fn assets_for(app: &AppHandle, recipe: &Recipe) -> Result<Arc<VisionAssets>,
     let name = format!("{}-{}", recipe.id, &recipe.hash[..8.min(recipe.hash.len())]);
     let assets = match source {
         CameraSource::Sim => {
+            if !matches!(recipe.path, Some(crate::recipe::PathSpec::RoundedRect { .. })) {
+                return Err("模拟相机只会合成圆角矩形胶路的飞拍图像".into());
+            }
             let dir = root.join("sim").join(name);
             let file = dir.join("vision.json");
             match VisionAssets::load(&file).filter(|a| a.recipe_hash == recipe.hash && a.shots.iter().all(|s| s.template.exists())) {
@@ -264,10 +314,13 @@ pub fn assets_for(app: &AppHandle, recipe: &Recipe) -> Result<Arc<VisionAssets>,
                 }
             }
         }
-        CameraSource::Mvs => {
-            let dir = root.join("taught").join(name);
+        CameraSource::Mvs | CameraSource::Replay => {
+            let dir = root.join("taught").join(&recipe.id);
             let mut a = VisionAssets::load(&dir.join("vision.json")).ok_or_else(|| format!("配方 {} 尚未示教", recipe.id))?;
-            a.calib = station_calib_path(app)?;
+            if a.recipe_hash != recipe.geometry_hash() {
+                return Err(format!("配方 {} 的胶路或拍照点改过，需要重新示教", recipe.id));
+            }
+            a.calib = station_calib_path(app, recipe.camera)?;
             a
         }
     };
@@ -276,19 +329,6 @@ pub fn assets_for(app: &AppHandle, recipe: &Recipe) -> Result<Arc<VisionAssets>,
     Ok(assets)
 }
 
-/// 启用 lyFlow 测量且核心库加载成功时，取图回调才拷贝整帧。设置变了之后调一次。
-pub fn apply_settings(app: &AppHandle) -> bool {
-    let settings = app.state::<CycleHost>().settings();
-    let on = settings.vision && app.state::<VisionHost>().engine(settings.lyflow_core.as_deref()).is_some();
-    app.state::<CycleHost>().camera.set_capture_full(on);
-    on
-}
-
-/// 当前是否用 lyFlow 测量。
-pub fn enabled(app: &AppHandle) -> bool {
-    let settings = app.state::<CycleHost>().settings();
-    settings.vision && app.state::<VisionHost>().engine(settings.lyflow_core.as_deref()).is_some()
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -318,21 +358,21 @@ fn calib_info(path: &Path) -> Option<CalibInfo> {
 }
 
 #[tauri::command]
-pub fn vision_calib_info(app: AppHandle) -> Result<Option<CalibInfo>, String> {
-    Ok(calib_info(&station_calib_path(&app)?))
+pub fn vision_calib_info(app: AppHandle, cam: Option<u8>) -> Result<Option<CalibInfo>, String> {
+    Ok(calib_info(&station_calib_path(&app, cam.unwrap_or(0))?))
 }
 
-/// 工位标定：用相机最近一帧整图跑 image.board_calib，结果存成工位标定文件。
+/// 工位标定：用飞拍相机最近一帧整图跑 image.board_calib，结果存成工位标定文件。
 #[tauri::command]
-pub async fn vision_calibrate(app: AppHandle, pattern: [f64; 2], square: f64) -> Result<CalibInfo, String> {
+pub async fn vision_calibrate(app: AppHandle, pattern: [f64; 2], square: f64, cam: Option<u8>) -> Result<CalibInfo, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let settings = app.state::<CycleHost>().settings();
         let engine = app.state::<VisionHost>().engine(settings.lyflow_core.as_deref()).ok_or("lyFlow 核心库未加载")?;
         let image = app
             .state::<CycleHost>()
             .camera
-            .last_full()
-            .ok_or("还没有整帧图像：启用 lyFlow 测量后软触发一帧（标定板放在内边所在高度）")?;
+            .last_full(cam.unwrap_or(0))
+            .ok_or("还没有整帧图像：打开图像测量后软触发一帧（标定板放在内边所在高度）")?;
         let graph = json!({
             "schemaVersion": 1,
             "id": "01TUJIAOBOARDCALIB00000000",
@@ -354,7 +394,7 @@ pub async fn vision_calibrate(app: AppHandle, pattern: [f64; 2], square: f64) ->
             });
         }
         let data = r.record("calib").cloned().ok_or("标定没有输出")?;
-        let path = station_calib_path(&app)?;
+        let path = station_calib_path(&app, cam.unwrap_or(0))?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }

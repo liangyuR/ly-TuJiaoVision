@@ -1,0 +1,333 @@
+//! 随动检测的几何：相机装在胶枪上，胶嘴在图像里位置固定；工件坐标里胶嘴后方已涂好的那段胶条，
+//! 经"相对胶嘴的位移 → 旋转（相机方位）→ 缩放（像素当量）"落到图像上。
+//! 假设胶枪在涂胶过程中姿态不变（三目方案的前提：不管往哪个方向走，总有一台相机看得到身后的胶）。
+
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+
+use crate::recipe::{FollowSpec, FollowTiming, Recipe};
+
+/// 一台随动相机相对胶嘴的标定（示教得到，属于相机工位，不随配方变）。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FollowCalib {
+    /// 胶嘴中心的像素坐标
+    pub nozzle: [f32; 2],
+    /// 工件坐标方向转到图像方向的角度（度，顺时针为正）
+    pub angle_deg: f32,
+    /// 工件坐标 x 轴在图像里是否镜像
+    #[serde(default)]
+    pub mirror: bool,
+    pub mm_per_px: f32,
+    /// 胶嘴遮挡半径（像素），圆内不测
+    pub mask_px: f32,
+    pub image_size: [u32; 2],
+}
+
+impl FollowCalib {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(self.mm_per_px > 0.001 && self.mm_per_px < 5.0) {
+            return Err("像素当量需在 0.001–5 mm/px 之间".into());
+        }
+        if !(self.mask_px >= 0.0 && self.image_size[0] > 16 && self.image_size[1] > 16) {
+            return Err("胶嘴遮挡半径不能为负，图像尺寸需大于 16 px".into());
+        }
+        if !self.nozzle.iter().chain([self.angle_deg].iter()).all(|v| v.is_finite()) {
+            return Err("胶嘴位置与方位必须是有限数".into());
+        }
+        Ok(())
+    }
+
+    /// 工件坐标里相对胶嘴的位移（mm）→ 像素。
+    pub fn to_px(&self, d: [f32; 2]) -> [f32; 2] {
+        let [x, y] = self.dir_to_img(d);
+        [self.nozzle[0] + x / self.mm_per_px, self.nozzle[1] + y / self.mm_per_px]
+    }
+
+
+    /// 工件坐标里的方向 → 图像里的方向（不缩放）。
+    pub fn dir_to_img(&self, d: [f32; 2]) -> [f32; 2] {
+        let x = if self.mirror { -d[0] } else { d[0] };
+        let (s, c) = self.angle_deg.to_radians().sin_cos();
+        [x * c - d[1] * s, x * s + d[1] * c]
+    }
+
+    /// 像素点离图像边界至少 margin 像素。
+    pub fn inside(&self, p: [f32; 2], margin: f32) -> bool {
+        let [w, h] = self.image_size.map(|v| v as f32);
+        p[0] >= margin && p[1] >= margin && p[0] <= w - 1.0 - margin && p[1] <= h - 1.0 - margin
+    }
+
+    /// 像素点离图像边界与胶嘴遮挡区都至少 margin 像素。
+    pub fn usable(&self, p: [f32; 2], margin: f32) -> bool {
+        let (dx, dy) = (p[0] - self.nozzle[0], p[1] - self.nozzle[1]);
+        self.inside(p, margin) && (dx * dx + dy * dy).sqrt() > self.mask_px + margin
+    }
+}
+
+/// 胶嘴在弧长 s 时，测量点 j 在它身后多远（mm）；还没涂到返回 None。闭合胶路绕圈后取最近一圈。
+pub fn behind(recipe: &Recipe, s: f32, j: usize) -> Option<f32> {
+    let sj = j as f32 * recipe.spacing;
+    if s < sj {
+        return None;
+    }
+    Some(if recipe.closed { (s - sj).rem_euclid(recipe.length()) } else { s - sj })
+}
+
+/// 一个测量点在某帧图像里的位置与法向（像素、单位向量）。
+pub fn project(recipe: &Recipe, calib: &FollowCalib, s_nozzle: f32, j: usize) -> ([f32; 2], [f32; 2]) {
+    let n = recipe.pos(s_nozzle);
+    let s = j as f32 * recipe.spacing;
+    let p = [recipe.points.x[j], recipe.points.y[j]];
+    (calib.to_px([p[0] - n[0], p[1] - n[1]]), calib.dir_to_img(recipe.normal(s)))
+}
+
+/// 这台相机在胶嘴位于 s 时能测到的点：在可测窗口里、投影落在图像内且不被胶嘴挡住。
+/// 远端多放一个测量步长：丢了一帧时，刚出窗口还没测的点下一帧还能补上。
+pub fn visible(recipe: &Recipe, spec: &FollowSpec, calib: &FollowCalib, s: f32) -> Vec<usize> {
+    let sp = recipe.spacing;
+    let margin = spec.search_mm / calib.mm_per_px + 2.0;
+    let n = recipe.point_count();
+    let far = spec.far_mm + spec.step_mm;
+    let mut out = Vec::new();
+    // 只看窗口覆盖的那一小段弧长，不遍历整条胶路
+    let first = ((s - far) / sp).floor() as i64;
+    let last = ((s - spec.near_mm) / sp).ceil() as i64;
+    for i in first..=last {
+        let j = if recipe.closed { i.rem_euclid(n as i64) as usize } else if i < 0 || i >= n as i64 { continue } else { i as usize };
+        let Some(b) = behind(recipe, s, j) else { continue };
+        if b < spec.near_mm || b > far || out.contains(&j) {
+            continue;
+        }
+        if calib.usable(project(recipe, calib, s, j).0, margin) {
+            out.push(j);
+        }
+    }
+    out
+}
+
+/// 一件工件在随动检测中的覆盖状态：哪些点已经分给某一帧去测。
+pub struct Tracker {
+    pub recipe: Arc<Recipe>,
+    spec: FollowSpec,
+    cams: Vec<(u8, FollowCalib)>,
+    covered: Vec<bool>,
+    /// 布防时刻（ms），按时间推算胶嘴位置的起点
+    pub armed_ts: i64,
+    /// 从图像里估出来的胶嘴位置修正（mm），加到推算值上
+    pub offset: f32,
+    start_synced: bool,
+    start_probe_pending: bool,
+    /// 每次起点同步改了位置就 +1；更早发出的帧里起点附近与缺胶的读数作废
+    pub generation: u32,
+    /// 起点同步修正的量（mm）
+    pub start_delta: f32,
+    plc: Progress,
+    /// 各相机上一帧的胶嘴位置，与相邻两帧间胶嘴走过的距离（平滑后）
+    last_s: Vec<Option<f32>>,
+    advance: f32,
+}
+
+/// PLC 进度寄存器只在轮询时读到，帧的时刻与轮询时刻差着几十毫秒：
+/// 以"值第一次读到时的轮询时刻"为基准，用相隔至少 30 ms 的两次变化估出速度，外推到帧的时刻。
+#[derive(Default)]
+struct Progress {
+    /// 布防时寄存器里的值：PLC 没清零时（还是上一件的终值）以它为零点；之后读到更小的值说明 PLC 清零了，零点回到 0
+    zero: Option<f32>,
+    /// 最近一次变化后的值与它第一次被读到的轮询时刻
+    last: Option<(f32, i64)>,
+    /// 估速度用的基准点
+    base: Option<(f32, i64)>,
+    speed: f32,
+}
+
+impl Progress {
+    fn extrapolate(&mut self, value: f32, poll_ts: i64, frame_ts: i64) -> f32 {
+        let zero = *self.zero.get_or_insert(value);
+        if value < zero - 1e-3 {
+            self.zero = Some(0.0);
+            self.last = None;
+            self.base = None;
+        }
+        let value = value - self.zero.unwrap();
+        if self.last.is_none_or(|(v, _)| (value - v).abs() > 1e-3) {
+            self.last = Some((value, poll_ts));
+            match self.base {
+                Some((bv, bt)) if poll_ts - bt >= 30 => {
+                    let inst = ((value - bv) / ((poll_ts - bt) as f32 / 1000.0)).clamp(0.0, 2000.0);
+                    self.speed = if self.speed == 0.0 { inst } else { 0.7 * self.speed + 0.3 * inst };
+                    self.base = Some((value, poll_ts));
+                }
+                None => self.base = Some((value, poll_ts)),
+                _ => {}
+            }
+        }
+        let (v, t) = self.last.unwrap();
+        // 外推最多 0.3 s（几个轮询周期），PLC 真停了就停在那之后的位置上
+        v + self.speed * ((frame_ts - t).clamp(0, 300) as f32 / 1000.0)
+    }
+}
+
+/// 某帧要测的点；start_probe 为真时这一帧还要找胶条起点，做起点同步。
+pub struct Plan {
+    pub points: Vec<u32>,
+    pub start_probe: bool,
+}
+
+/// 单帧横向同步的修正量只采纳这么多，压住单帧噪声。
+const LATERAL_GAIN: f32 = 0.7;
+
+impl Tracker {
+    pub fn new(recipe: Arc<Recipe>, cams: Vec<(u8, FollowCalib)>, armed_ts: i64) -> Result<Self, String> {
+        let spec = recipe.follow.clone().ok_or("配方没有随动参数")?;
+        if cams.is_empty() {
+            return Err("随动相机都没有标定".into());
+        }
+        let n = recipe.point_count();
+        Ok(Self { recipe, spec, cams, covered: vec![false; n], armed_ts, offset: 0.0, start_synced: false, start_probe_pending: false, generation: 0, start_delta: 0.0, plc: Progress::default(), last_s: vec![None; 8], advance: 0.0 })
+    }
+
+    /// 胶嘴位置：按时间推算（或用 PLC 给的进度），再加上从图像里同步出来的修正。
+    /// plc_progress：PLC 进度寄存器的值与读到它的轮询时刻。
+    pub fn nozzle_s(&mut self, ts: i64, plc_progress: Option<(f32, i64)>) -> Option<f32> {
+        let raw = match self.spec.timing {
+            FollowTiming::Timed { speed_mm_s, delay_ms } => Some(speed_mm_s * ((ts - self.armed_ts) as f32 - delay_ms) / 1000.0),
+            FollowTiming::Plc { scale } => plc_progress.map(|(p, poll_ts)| self.plc.extrapolate(p * scale, poll_ts, ts)),
+        };
+        raw.map(|s| s + self.offset)
+    }
+
+    /// 胶条起点可能在图上：可以沿胶路找它在哪里断开，一次校正起步误差。
+    /// 胶嘴附近一段被遮住，推算又可能超前好几毫米，所以比可测窗口放宽到远端再加一个步长和 6 mm。
+    fn start_in_window(&self, s: f32) -> bool {
+        s - self.spec.near_mm - 2.0 > 0.0 && s < self.spec.far_mm + self.spec.step_mm + 6.0
+    }
+
+    /// 起点同步的结果：δ = 推算位置 − 实际位置。返回同步前按错的位置测过、需要重测的候选点（已分出去且在胶嘴身后的）；
+    /// 调用方挑出真正测坏的（起点附近、测成缺胶的）用 release 放回去。
+    pub fn apply_start(&mut self, delta: Option<f32>, s: f32) -> Vec<u32> {
+        self.start_probe_pending = false;
+        let Some(d) = delta else {
+            // 找不到起点：还在可找的范围里就等下一帧再找，出了范围由 start_given_up 收尾
+            return Vec::new();
+        };
+        self.start_synced = true;
+        self.offset -= d;
+        self.start_delta = d;
+        self.generation += 1;
+        let sp = self.recipe.spacing;
+        (0..self.covered.len()).filter(|&j| self.covered[j] && (j as f32 * sp) < s).map(|j| j as u32).collect()
+    }
+
+    /// 拐角处的横向同步：δ = 推算位置 − 实际位置。
+    pub fn apply_lateral(&mut self, delta: f32) {
+        self.offset -= LATERAL_GAIN * delta;
+    }
+
+    /// 起点同步一直没成、胶条起点已经出了窗口时返回 true（只返回一次）。
+    pub fn start_given_up(&mut self, s: f32) -> bool {
+        if !self.start_synced && !self.start_probe_pending && s >= self.spec.far_mm + self.spec.step_mm + 6.0 {
+            self.start_synced = true;
+            return true;
+        }
+        false
+    }
+
+    /// 胶嘴位于 s 时由哪台相机测：能看到的点最多的那台。
+    fn best_cam(&self, s: f32) -> Option<(u8, Vec<usize>)> {
+        self.cams
+            .iter()
+            .map(|(c, calib)| (*c, visible(&self.recipe, &self.spec, calib, s)))
+            .filter(|(_, v)| !v.is_empty())
+            .max_by(|a, b| a.1.len().cmp(&b.1.len()).then(b.0.cmp(&a.0)))
+    }
+
+    /// 相机 cam 在胶嘴位于 s 时拍到的一帧：要不要测、测哪些点。分出去的点记为已覆盖。
+    pub fn plan(&mut self, cam: u8, s: f32) -> Option<Plan> {
+        if let Some(prev) = self.last_s.get(cam as usize).copied().flatten() {
+            let d = s - prev;
+            if d > 0.0 && d < self.spec.far_mm {
+                self.advance = if self.advance == 0.0 { d } else { 0.8 * self.advance + 0.2 * d };
+            }
+        }
+        if let Some(slot) = self.last_s.get_mut(cam as usize) {
+            *slot = Some(s);
+        }
+        if s < self.spec.near_mm {
+            return None;
+        }
+        let (best, visible) = self.best_cam(s)?;
+        if best != cam {
+            return None;
+        }
+        let fresh: Vec<usize> = visible.into_iter().filter(|&j| !self.covered[j]).collect();
+        let start_probe = !self.start_synced && !self.start_probe_pending && self.start_in_window(s);
+        let sp = self.recipe.spacing;
+        let oldest = fresh.iter().filter_map(|&j| behind(&self.recipe, s, j)).fold(0.0f32, f32::max);
+        let enough = fresh.len() as f32 * sp >= self.spec.step_mm;
+        // 最老的那个点等不到下一帧就要出窗口了，不等攒够也测（胶嘴遮挡与搜索余量让实际窗口比配置的短）
+        let leaving = oldest + (self.advance * 1.5).max(self.spec.step_mm) >= self.spec.far_mm;
+        if !start_probe && (fresh.is_empty() || !(enough || leaving)) {
+            return None;
+        }
+        for &j in &fresh {
+            self.covered[j] = true;
+        }
+        self.start_probe_pending |= start_probe;
+        Some(Plan { points: fresh.into_iter().map(|j| j as u32).collect(), start_probe })
+    }
+
+
+    /// 测不成的点放回去，之后的帧还在窗口里就再测一次。
+    pub fn release(&mut self, points: &[u32]) {
+        for &j in points {
+            if let Some(c) = self.covered.get_mut(j as usize) {
+                *c = false;
+            }
+        }
+    }
+
+    /// 标定过的相机里，胶嘴走完全程所需的名义弧长（含超行程）。
+    pub fn end_s(&self) -> f32 {
+        self.recipe.length() + self.spec.overrun_mm
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::recipe::builtin;
+
+    /// 三台相机 120° 均布，胶嘴在图像下方正中，身后的胶条朝图像上方延伸。
+    pub fn tri_calib() -> Vec<(u8, FollowCalib)> {
+        (0..3u8)
+            .map(|c| {
+                (c, FollowCalib { nozzle: [640.0, 900.0], angle_deg: 120.0 * c as f32, mirror: false, mm_per_px: 0.05, mask_px: 60.0, image_size: [1280, 1024] })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn projection_rotates_then_scales() {
+        let c = FollowCalib { nozzle: [100.0, 200.0], angle_deg: 90.0, mirror: true, mm_per_px: 0.5, mask_px: 0.0, image_size: [640, 480] };
+        // 镜像后 (1,0) → (−1,0)，再顺时针转 90° → (0,−1)
+        let p = c.to_px([1.0, 0.0]);
+        assert!((p[0] - 100.0).abs() < 1e-4 && (p[1] - 198.0).abs() < 1e-4, "{p:?}");
+    }
+
+    #[test]
+    fn three_cameras_cover_whole_closed_path() {
+        let recipe = builtin().into_iter().find(|r| r.follow.is_some()).unwrap();
+        let mut t = Tracker::new(recipe.clone(), tri_calib(), 0).unwrap();
+        let mut s = 0.0;
+        while s < t.end_s() {
+            for c in 0..3 {
+                t.plan(c, s);
+            }
+            s += 80.0 / 25.0;
+        }
+        let missed = t.covered.iter().filter(|c| !**c).count();
+        assert_eq!(missed, 0, "未覆盖 {missed} 点");
+    }
+}

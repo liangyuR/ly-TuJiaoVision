@@ -4,6 +4,7 @@ export const verdictLabel: Record<Verdict, string> = {
   OK: "OK",
   OK_WITH_EXCURSION: "OK · 局部超差",
   NG_POSITION: "NG · 位置超差",
+  NG_WIDTH: "NG · 胶宽超差",
   NG_ABSOLUTE: "NG · 超绝对限",
   NG_GAP: "NG · 断胶",
   ERR_INSPECT: "ERR · 未测成",
@@ -16,7 +17,7 @@ export function verdictClass(v: Verdict) {
 export const verdictGroups: { key: string; label: string; verdicts: Verdict[] }[] = [
   { key: "ok", label: "OK", verdicts: ["OK"] },
   { key: "excursion", label: "局部超差", verdicts: ["OK_WITH_EXCURSION"] },
-  { key: "ng", label: "NG", verdicts: ["NG_POSITION", "NG_ABSOLUTE", "NG_GAP"] },
+  { key: "ng", label: "NG", verdicts: ["NG_POSITION", "NG_WIDTH", "NG_ABSOLUTE", "NG_GAP"] },
   { key: "err", label: "ERR", verdicts: ["ERR_INSPECT"] },
 ];
 

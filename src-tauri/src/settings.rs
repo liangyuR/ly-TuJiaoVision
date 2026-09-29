@@ -3,6 +3,17 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+/// 帧录制：把一件工件的整帧图像与元数据落盘，供回放相机重放。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RecordMode {
+    #[default]
+    Off,
+    /// 只留 NG / ERR 件
+    Failed,
+    All,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ProductSource {
@@ -53,8 +64,15 @@ pub struct CycleSettings {
     pub history_days: u32,
     /// lyFlow 核心库（lyflow_core.dll）路径
     pub lyflow_core: Option<String>,
-    /// 用 lyFlow 流程测量（定位 + 逐点卡尺）；关闭时用模拟测量
+    /// 飞拍配方用 lyFlow 流程测量图像；关闭时用模拟测量
     pub vision: bool,
+    /// 随动配方用本程序卡尺测量图像；关闭时用模拟测量
+    #[serde(default = "yes")]
+    pub follow_vision: bool,
+    pub record: RecordMode,
+    /// 帧录制最多保留多少件、总共多少 GB，超出删最旧的（随动一件三路约 0.5 GB）
+    pub record_keep: u32,
+    pub record_max_gb: f32,
 }
 
 impl Default for CycleSettings {
@@ -66,8 +84,16 @@ impl Default for CycleSettings {
             history_days: 180,
             lyflow_core: std::env::var("LYFLOW_CORE_DLL").ok(),
             vision: false,
+            follow_vision: true,
+            record: RecordMode::Off,
+            record_keep: 100,
+            record_max_gb: 20.0,
         }
     }
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl CycleSettings {
@@ -93,6 +119,12 @@ impl CycleSettings {
         }
         if t.motion_ms < 1000 || t.proc_ms < 200 || t.ack_ms < 500 {
             return Err("超时参数过小".into());
+        }
+        if !(1..=100_000).contains(&self.record_keep) {
+            return Err("帧录制保留件数需在 1–100000 之间".into());
+        }
+        if !(self.record_max_gb >= 0.5 && self.record_max_gb <= 10_000.0) {
+            return Err("帧录制总大小需在 0.5–10000 GB 之间".into());
         }
         Ok(())
     }

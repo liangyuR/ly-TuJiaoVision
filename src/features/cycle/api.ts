@@ -1,7 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { useEffect, useState } from "react";
 import { subscribe } from "../plc";
-import type { CycleSettings, LogLine, Measured, Recipe, RecipeSummary, Scenario, SimStatus, Snapshot } from "./types";
+import type { CycleSettings, InspectMode, LogLine, Measured, Recipe, RecipeDoc, RecipeSummary, Scenario, SimStatus, Snapshot } from "./types";
 
 function call<T>(cmd: string, args: Record<string, unknown> | undefined, fallback: () => T): Promise<T> {
   if (!isTauri()) return Promise.resolve(fallback());
@@ -15,6 +15,10 @@ const defaultSettings: CycleSettings = {
   historyDays: 180,
   lyflowCore: null,
   vision: false,
+  followVision: true,
+  record: "off",
+  recordKeep: 100,
+  recordMaxGb: 20,
 };
 
 export const cycleApi = {
@@ -33,10 +37,39 @@ export const cycleApi = {
   simStop: () => call<void>("sim_stop", undefined, () => undefined),
 };
 
-const layoutCache = new Map<string, Promise<Recipe | null>>();
+export const recipeApi = {
+  list: () => call<{ recipes: RecipeSummary[]; errors: string[] }>("recipe_list", undefined, () => ({ recipes: [], errors: [] })),
+  doc: (id: string) => call<RecipeDoc>("recipe_doc", { id }, () => Promise.reject("非桌面环境") as never),
+  preview: (doc: RecipeDoc) => call<Recipe>("recipe_preview", { doc }, () => Promise.reject("非桌面环境") as never),
+  template: (mode: InspectMode) => call<RecipeDoc>("recipe_template", { mode }, () => Promise.reject("非桌面环境") as never),
+  save: (doc: RecipeDoc, originalId: string | null) =>
+    call<RecipeSummary>("recipe_save", { doc, originalId }, () => Promise.reject("非桌面环境") as never).then((r) => {
+      layoutCache.clear();
+      notifyRecipes();
+      return r;
+    }),
+  remove: (id: string) =>
+    call<void>("recipe_delete", { id }, () => undefined).then(() => {
+      layoutCache.clear();
+      notifyRecipes();
+    }),
+  parsePoints: (text: string, fileName: string) => call<[number, number][]>("recipe_parse_points", { text, fileName }, () => []),
+};
 
-export function useLayout(recipeId: string | null | undefined) {
+const layoutCache = new Map<string, Promise<Recipe | null>>();
+const recipeListeners = new Set<() => void>();
+function notifyRecipes() {
+  recipeListeners.forEach((f) => f());
+}
+
+export function useLayout(recipeId: string | null | undefined, version?: number) {
   const [layout, setLayout] = useState<Recipe | null>(null);
+  const [gen, setGen] = useState(0);
+  useEffect(() => {
+    const f = () => setGen((g) => g + 1);
+    recipeListeners.add(f);
+    return () => void recipeListeners.delete(f);
+  }, []);
   useEffect(() => {
     if (!recipeId) return setLayout(null);
     if (!layoutCache.has(recipeId)) layoutCache.set(recipeId, cycleApi.layout(recipeId).catch(() => null));
@@ -45,14 +78,17 @@ export function useLayout(recipeId: string | null | undefined) {
     return () => {
       alive = false;
     };
-  }, [recipeId]);
+  }, [recipeId, version, gen]);
   return layout;
 }
 
 export function useRecipes() {
   const [recipes, setRecipes] = useState<RecipeSummary[]>([]);
   useEffect(() => {
-    cycleApi.recipes().then(setRecipes).catch(() => setRecipes([]));
+    const load = () => cycleApi.recipes().then(setRecipes).catch(() => setRecipes([]));
+    load();
+    recipeListeners.add(load);
+    return () => void recipeListeners.delete(load);
   }, []);
   return recipes;
 }

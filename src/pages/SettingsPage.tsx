@@ -10,6 +10,12 @@ const timeoutFields: [keyof Timeouts, string, string][] = [
   ["ackMs", "结果确认 T_ack（ms）", "done↑ 后等待 resultAck↑"],
 ];
 
+/** 两个面板各管一部分字段：保存时读回最新设置、只改自己的字段，另一个面板刚保存的内容不被旧值覆盖。 */
+async function savePart(part: Partial<CycleSettings>) {
+  const cur = await cycleApi.getSettings();
+  await cycleApi.saveSettings({ ...cur, ...part });
+}
+
 function CycleSettingsPanel() {
   const recipes = useRecipes();
   const [settings, setSettings] = useState<CycleSettings | null>(null);
@@ -20,11 +26,15 @@ function CycleSettingsPanel() {
   }, []);
   if (!settings) return null;
 
-  const save = () =>
-    cycleApi
-      .saveSettings(settings)
-      .then(() => setNotice({ ok: true, text: "已保存，从下一个工件开始生效" }))
-      .catch((e) => setNotice({ ok: false, text: String(e) }));
+  const save = async () => {
+    try {
+      const { productSource, manualRecipeId, historyDays, timeouts } = settings;
+      await savePart({ productSource, manualRecipeId, historyDays, timeouts });
+      setNotice({ ok: true, text: "已保存，从下一个工件开始生效" });
+    } catch (e) {
+      setNotice({ ok: false, text: String(e) });
+    }
+  };
 
   return (
     <div className="panel">
@@ -97,7 +107,7 @@ function CycleSettingsPanel() {
   );
 }
 
-function VisionPanel() {
+function MeasurePanel() {
   const [settings, setSettings] = useState<CycleSettings | null>(null);
   const [engine, setEngine] = useState<EngineStatus | null>(null);
   const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null);
@@ -111,7 +121,8 @@ function VisionPanel() {
 
   const save = async () => {
     try {
-      await cycleApi.saveSettings(settings);
+      const { lyflowCore, vision, followVision, record, recordKeep, recordMaxGb } = settings;
+      await savePart({ lyflowCore, vision, followVision, record, recordKeep, recordMaxGb });
       setNotice({ ok: true, text: "已保存" });
     } catch (e) {
       setNotice({ ok: false, text: String(e) });
@@ -122,35 +133,79 @@ function VisionPanel() {
   return (
     <div className="panel">
       <div className="panel-toolbar">
-        <h3 className="panel-title">视觉测量（lyFlow）</h3>
+        <h3 className="panel-title">测量与帧录制</h3>
         <button className="btn primary" onClick={save}>保存</button>
       </div>
       <div className="form-grid">
-        <label className="field span-2">
-          <span>核心库路径（lyflow_core.dll）</span>
+        <label className="field">
+          <span>飞拍配方</span>
+          <select id="measure-fly" className="input" value={settings.vision ? "lyFlow" : "sim"} onChange={(e) => setSettings({ ...settings, vision: e.target.value === "lyFlow" })}>
+            <option value="sim">模拟测量（不看图像）</option>
+            <option value="lyFlow">lyFlow 流程（模板定位 + 逐点卡尺）</option>
+          </select>
+        </label>
+        <label className="field">
+          <span>随动配方</span>
+          <select id="measure-follow" className="input" value={settings.followVision ? "native" : "sim"} onChange={(e) => setSettings({ ...settings, followVision: e.target.value === "native" })}>
+            <option value="native">本程序卡尺</option>
+            <option value="sim">模拟测量（不看图像）</option>
+          </select>
+        </label>
+        {settings.vision && (
+          <label className="field span-2">
+            <span>核心库路径（lyflow_core.dll）</span>
+            <input
+              id="lyflow-core"
+              className="input mono"
+              placeholder="例如 D:\project\LyFlow\build\core\bin\lyflow_core.dll"
+              value={settings.lyflowCore ?? ""}
+              onChange={(e) => setSettings({ ...settings, lyflowCore: e.target.value || null })}
+            />
+          </label>
+        )}
+        <label className="field">
+          <span>帧录制</span>
+          <select id="record-mode" className="input" value={settings.record} onChange={(e) => setSettings({ ...settings, record: e.target.value as CycleSettings["record"] })}>
+            <option value="off">关闭</option>
+            <option value="failed">只留 NG / ERR 件</option>
+            <option value="all">全部</option>
+          </select>
+        </label>
+        <label className="field">
+          <span>录制最多保留（件）</span>
           <input
-            id="lyflow-core"
+            id="record-keep"
             className="input mono"
-            placeholder="例如 D:\project\LyFlow-glueuild\corein\lyflow_core.dll"
-            value={settings.lyflowCore ?? ""}
-            onChange={(e) => setSettings({ ...settings, lyflowCore: e.target.value || null })}
+            type="number"
+            min={1}
+            value={settings.recordKeep}
+            onChange={(e) => setSettings({ ...settings, recordKeep: Number(e.target.value) })}
           />
         </label>
-        <label className="check" style={{ alignSelf: "end", height: 32 }}>
-          <input id="vision-on" type="checkbox" checked={settings.vision} onChange={(e) => setSettings({ ...settings, vision: e.target.checked })} />
-          用 lyFlow 测量（定位 + 逐点卡尺）
+        <label className="field" title="随动一件三路约 0.5 GB">
+          <span>录制总大小上限（GB）</span>
+          <input
+            id="record-max-gb"
+            className="input mono"
+            type="number"
+            min={0.5}
+            step={1}
+            value={settings.recordMaxGb}
+            onChange={(e) => setSettings({ ...settings, recordMaxGb: Number(e.target.value) })}
+          />
         </label>
       </div>
       <dl className="kv" style={{ marginTop: 12 }}>
-        <dt>状态</dt>
+        <dt>引擎</dt>
         <dd className={engine?.ready ? "ok" : "muted"}>
-          {engine ? `${engine.ready ? "已加载" : "未加载"}${engine.version ? ` · ${engine.version}` : ""}` : "--"}
+          {engine ? `${engine.backend} · ${engine.ready ? "就绪" : "未就绪"}${engine.version ? ` · ${engine.version}` : ""}` : "--"}
         </dd>
         <dt>说明</dt>
         <dd>{engine?.message ?? "--"}</dd>
       </dl>
       <p className="muted hint">
-        关闭时用模拟测量。打开后，模拟相机按配方几何合成图像并自动生成示教资料；海康相机需要先示教配方、再在图像源页做工位标定。
+        本程序卡尺用于随动配方：按随动标定把胶路投到图像上，沿法向找胶条两侧边缘，得出偏移与胶宽。lyFlow 流程用于飞拍配方（模板定位 +
+        逐点卡尺），需要带图像域的 lyFlow 版本。帧录制把整帧图像写到数据目录的 records 下，可在图像源页选作回放目录。
       </p>
       {notice && <div className={`notice ${notice.ok ? "ok" : "error"}`}>{notice.text}</div>}
     </div>
@@ -167,7 +222,7 @@ export default function SettingsPage() {
   return (
     <div className="stack">
       <CycleSettingsPanel />
-      <VisionPanel />
+      <MeasurePanel />
       <div className="panel">
         <h3 className="panel-title">关于</h3>
         <dl className="kv">

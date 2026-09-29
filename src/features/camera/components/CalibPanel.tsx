@@ -13,7 +13,7 @@ interface CalibInfo {
 }
 
 /** 工位标定：标定板放在内边所在高度，软触发一帧，用 lyFlow 的 image.board_calib 求单应，存为工位标定文件。 */
-export default function CalibPanel({ isSim }: { isSim: boolean }) {
+export default function CalibPanel({ cam, isSim }: { cam: number; isSim: boolean }) {
   const [info, setInfo] = useState<CalibInfo | null>(null);
   const [cols, setCols] = useState(11);
   const [rows, setRows] = useState(8);
@@ -22,14 +22,14 @@ export default function CalibPanel({ isSim }: { isSim: boolean }) {
   const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null);
 
   useEffect(() => {
-    if (isTauri()) invoke<CalibInfo | null>("vision_calib_info").then(setInfo).catch(() => setInfo(null));
-  }, []);
+    if (isTauri()) invoke<CalibInfo | null>("vision_calib_info", { cam }).then(setInfo).catch(() => setInfo(null));
+  }, [cam]);
 
   const run = async () => {
     setBusy(true);
     setNotice(null);
     try {
-      const r = await invoke<CalibInfo>("vision_calibrate", { pattern: [cols, rows], square });
+      const r = await invoke<CalibInfo>("vision_calibrate", { pattern: [cols, rows], square, cam });
       setInfo(r);
       setNotice({ ok: true, text: `标定完成：残差 RMS ${r.rms?.toFixed(4)} mm，约 ${r.mmPerPx?.toFixed(4)} mm/px` });
     } catch (e) {
@@ -42,8 +42,8 @@ export default function CalibPanel({ isSim }: { isSim: boolean }) {
   return (
     <div className="panel">
       <div className="panel-head">
-        <h3 className="panel-title">工位标定</h3>
-        <span className="muted">标定属于相机工位，换型不重标；标定板放在内边所在高度的平面上</span>
+        <h3 className="panel-title">工位标定（飞拍）</h3>
+        <span className="muted">用 lyFlow 求单应；标定属于相机工位，换型不重标；标定板放在内边所在高度的平面上</span>
         <span className="spacer" />
         <button className="btn primary" onClick={run} disabled={busy || isSim}>
           <Crosshair size={15} />

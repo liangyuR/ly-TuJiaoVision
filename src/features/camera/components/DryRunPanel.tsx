@@ -5,15 +5,16 @@ import type { DryFrame } from "../types";
 
 const H = 130;
 
-export default function DryRunPanel({ frameMs }: { frameMs: number | null }) {
+export default function DryRunPanel({ cam, frameMs }: { cam: number; frameMs: number | null }) {
   const [running, setRunning] = useState(false);
-  const [frames, setFrames] = useState<DryFrame[]>([]);
+  const [all, setAll] = useState<DryFrame[]>([]);
+  const frames = all.filter((f) => f.cam === cam);
   const [plan, setPlan] = useState(6);
   const [error, setError] = useState("");
 
   useEffect(() => {
     if (!running) return;
-    const timer = setInterval(() => cameraApi.dryRunGet().then((f) => f && setFrames(f)), 300);
+    const timer = setInterval(() => cameraApi.dryRunGet().then((f) => f && setAll(f)), 300);
     return () => clearInterval(timer);
   }, [running]);
 
@@ -21,14 +22,14 @@ export default function DryRunPanel({ frameMs }: { frameMs: number | null }) {
     setError("");
     try {
       await cameraApi.dryRunStart();
-      setFrames([]);
+      setAll([]);
       setRunning(true);
     } catch (e) {
       setError(String(e));
     }
   };
   const stop = async () => {
-    setFrames(await cameraApi.dryRunStop());
+    setAll(await cameraApi.dryRunStop());
     setRunning(false);
   };
 

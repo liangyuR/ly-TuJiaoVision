@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -7,22 +7,25 @@ use ly_plc::{now_ms, EdgeEvent, LinkState, PlcEngine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 
-use crate::camera::{CameraHost, CameraStatus, Frame};
-use crate::inspection::{read_tag_u32, tag, tag_is_on, write_tag};
-use crate::judge::{self, fault, Judgement, PointState, Verdict};
-use crate::measure::{self, Job, Measured};
-use crate::plc::PlcHost;
-use crate::recipe::{self, Recipe, TriggerMode};
-use crate::settings::{CycleSettings, ProductSource};
+use crate::camera::{Acquisition, CameraRig, CameraStatus, FRAME_QUEUE};
+use crate::follow::Tracker;
+use crate::frame::Frame;
 use crate::history;
+use crate::inspection::{read_tag_f32_ts, read_tag_u32, tag, tag_is_on, write_tag};
+use crate::judge::{self, fault, Judgement, PointState, Verdict};
+use crate::measure::{self, Job, JobKind, Measured, ST_INVALID};
+use crate::plc::PlcHost;
+use crate::recipe::{FollowTiming, InspectMode, Recipe, RecipeStore, TriggerMode};
+use crate::recorder::{Recorder, Recording};
+use crate::settings::{CycleSettings, ProductSource};
 use crate::sim::{Scenario, SimCtl};
 use crate::store::{PartRecord, Store, VerdictCounts};
 
 pub enum Input {
     Edge(EdgeEvent),
-    Frame(Frame),
     Measured(Measured),
     Reset,
     Refresh,
@@ -57,6 +60,11 @@ pub enum FrameStatus {
 #[serde(rename_all = "camelCase")]
 pub struct FrameView {
     pub status: FrameStatus,
+    #[serde(default)]
+    pub cam: u8,
+    /// 随动：胶嘴所在弧长
+    #[serde(default)]
+    pub s: Option<f32>,
     pub arrived_ms: Option<u64>,
     pub frame_counter: Option<u64>,
     pub trigger_counter: Option<u64>,
@@ -71,6 +79,8 @@ impl FrameView {
     fn waiting() -> Self {
         Self {
             status: FrameStatus::Waiting,
+            cam: 0,
+            s: None,
             arrived_ms: None,
             frame_counter: None,
             trigger_counter: None,
@@ -88,6 +98,8 @@ impl FrameView {
 pub struct PartView {
     pub sn: u32,
     pub recipe_id: String,
+    pub mode: InspectMode,
+    /// 飞拍的计划帧数；随动为 0
     pub n: usize,
     pub received: usize,
     pub triggers: u64,
@@ -95,6 +107,11 @@ pub struct PartView {
     pub filled: usize,
     pub total: usize,
     pub frames: Vec<FrameView>,
+    /// 随动：胶嘴当前弧长与走完全程（含超行程）的弧长
+    pub nozzle_s: Option<f32>,
+    pub end_s: Option<f32>,
+    /// 随动：最近一帧由哪台相机测
+    pub active_cam: Option<u8>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -132,12 +149,13 @@ pub struct Snapshot {
     pub product_source: ProductSource,
     pub active_recipe_id: Option<String>,
     pub trigger_mode: Option<TriggerMode>,
+    pub mode: Option<InspectMode>,
     pub part: Option<PartView>,
     pub result: Option<ResultView>,
     pub stats: Stats,
     pub stray_frames: u64,
     pub alarms: Vec<String>,
-    pub camera: CameraStatus,
+    pub cameras: Vec<CameraStatus>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -157,8 +175,28 @@ pub struct RecipeSummary {
     pub version: u32,
     pub hash: String,
     pub product_code: u16,
+    pub mode: InspectMode,
     pub shot_count: usize,
     pub trigger_mode: TriggerMode,
+    pub cameras: Vec<u8>,
+    pub length: f32,
+}
+
+impl From<&Recipe> for RecipeSummary {
+    fn from(r: &Recipe) -> Self {
+        Self {
+            id: r.id.clone(),
+            name: r.name.clone(),
+            version: r.version,
+            hash: r.hash.clone(),
+            product_code: r.product_code,
+            mode: r.mode,
+            shot_count: r.shot_count(),
+            trigger_mode: r.trigger_mode,
+            cameras: r.cameras(),
+            length: r.length(),
+        }
+    }
 }
 
 struct Shared {
@@ -170,23 +208,27 @@ struct Shared {
 
 pub struct CycleHost {
     pub tx: UnboundedSender<Input>,
-    pub camera: CameraHost,
+    pub camera: CameraRig,
     pub sim: SimCtl,
-    recipes: Vec<Arc<Recipe>>,
+    pub recipes: RecipeStore,
+    pub recorder: Recorder,
     settings_path: PathBuf,
     shared: Mutex<Shared>,
-    rx: Mutex<Option<UnboundedReceiver<Input>>>,
+    rx: Mutex<Option<(UnboundedReceiver<Input>, Receiver<Frame>)>>,
 }
 
 impl CycleHost {
     pub fn init(app: &AppHandle) -> Result<Self, String> {
         let settings_path = app.path().app_config_dir().map_err(|e| e.to_string())?.join("cycle.json");
+        let data = app.path().app_data_dir().map_err(|e| e.to_string())?;
         let (tx, rx) = unbounded_channel();
+        let (frame_tx, frame_rx) = channel(FRAME_QUEUE);
         Ok(Self {
-            camera: CameraHost::new(app, tx.clone())?,
+            camera: CameraRig::new(app, frame_tx)?,
             tx,
             sim: SimCtl::default(),
-            recipes: recipe::builtin(),
+            recipes: RecipeStore::open(data.join("recipes"))?,
+            recorder: Recorder::new(data.join("records")),
             shared: Mutex::new(Shared {
                 snapshot: None,
                 logs: VecDeque::new(),
@@ -194,14 +236,17 @@ impl CycleHost {
                 settings: CycleSettings::load(&settings_path),
             }),
             settings_path,
-            rx: Mutex::new(Some(rx)),
+            rx: Mutex::new(Some((rx, frame_rx))),
         })
     }
 
     pub fn start(app: &AppHandle) {
         let host = app.state::<CycleHost>();
-        let Some(mut rx) = host.rx.lock().unwrap().take() else { return };
+        let Some((mut rx, mut frames)) = host.rx.lock().unwrap().take() else { return };
         let mut machine = Machine::new(app.clone(), measure::spawn_worker(app.clone(), host.tx.clone()));
+        for e in host.recipes.errors() {
+            log(app, "err", "配方", e);
+        }
         tauri::async_runtime::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(20));
             machine.publish();
@@ -211,9 +256,11 @@ impl CycleHost {
                         Some(input) => machine.on_input(input).await,
                         None => break,
                     },
+                    Some(frame) = frames.recv() => machine.on_frame(frame),
                     _ = tick.tick() => machine.on_tick().await,
                 }
-                if machine.dirty {
+                // 随动时每秒几十帧，快照最多 20 次/秒
+                if machine.dirty && machine.published.elapsed() >= Duration::from_millis(50) {
                     machine.publish();
                 }
             }
@@ -225,11 +272,19 @@ impl CycleHost {
     }
 
     pub fn recipe(&self, id: &str) -> Option<Arc<Recipe>> {
-        self.recipes.iter().find(|r| r.id == id).cloned()
+        self.recipes.get(id)
     }
 
     pub fn settings(&self) -> CycleSettings {
         self.shared.lock().unwrap().settings.clone()
+    }
+
+    pub fn save_settings(&self, settings: CycleSettings) -> Result<(), String> {
+        settings.validate()?;
+        settings.save(&self.settings_path)?;
+        self.shared.lock().unwrap().settings = settings;
+        let _ = self.tx.send(Input::Refresh);
+        Ok(())
     }
 }
 
@@ -284,11 +339,22 @@ struct Part {
     armed_at: Instant,
     end_at: Option<Instant>,
     fault: Option<(u16, String)>,
+    follow: Option<Tracker>,
+    /// 随动：各帧分到的点，测量失败时放回去重测
+    jobs: HashMap<usize, (Vec<u32>, u32)>,
+    nozzle_s: Option<f32>,
+    active_cam: Option<u8>,
+    last_error: Option<String>,
+    recording: Option<Recording>,
 }
 
 impl Part {
     fn n(&self) -> usize {
         self.recipe.shot_count()
+    }
+
+    fn follow(&self) -> bool {
+        self.follow.is_some()
     }
 
     fn triggers(&self) -> u64 {
@@ -302,20 +368,24 @@ impl Part {
         PartView {
             sn: self.sn,
             recipe_id: self.recipe.id.clone(),
-            n: self.n(),
+            mode: self.recipe.mode,
+            n: if self.follow() { 0 } else { self.n() },
             received: self.received,
             triggers: self.triggers(),
             queue: self.queue,
             filled: self.table.iter().filter(|p| **p != PointState::Pending).count(),
             total: self.table.len(),
             frames: self.frames.clone(),
+            nozzle_s: self.nozzle_s,
+            end_s: self.follow.as_ref().map(|t| t.end_s()),
+            active_cam: self.active_cam,
         }
     }
 }
 
 struct Machine {
     app: AppHandle,
-    measure_tx: UnboundedSender<Job>,
+    measure_tx: Sender<Job>,
     phase: Phase,
     since: i64,
     part: Option<Part>,
@@ -331,10 +401,12 @@ struct Machine {
     stray_times: VecDeque<Instant>,
     alarms: Vec<String>,
     dirty: bool,
+    published: Instant,
+    dropped_seen: u64,
 }
 
 impl Machine {
-    fn new(app: AppHandle, measure_tx: UnboundedSender<Job>) -> Self {
+    fn new(app: AppHandle, measure_tx: Sender<Job>) -> Self {
         let stats = app.state::<Store>().counts_since(history::local_midnight_ms()).map(Stats::from).unwrap_or_default();
         Self {
             app,
@@ -354,6 +426,8 @@ impl Machine {
             stray_times: VecDeque::new(),
             alarms: Vec::new(),
             dirty: true,
+            published: Instant::now(),
+            dropped_seen: 0,
         }
     }
 
@@ -371,27 +445,43 @@ impl Machine {
         }
     }
 
-    fn publish(&mut self) {
-        self.dirty = false;
+    /// 当前配方（人工选择或上一件 PLC 下发的）。
+    fn current_recipe(&self) -> Option<Arc<Recipe>> {
         let host = host(&self.app);
         let settings = host.settings();
-        let active = match settings.product_source {
+        match settings.product_source {
             ProductSource::Manual => settings.manual_recipe_id.as_deref().and_then(|id| host.recipe(id)),
             ProductSource::Plc => self.active_recipe.clone(),
-        };
+        }
+    }
+
+    /// 需要就绪的相机：当前配方用到的；还不知道配方时是整个相机组。
+    fn required_cams(&self) -> Vec<u8> {
+        match self.current_recipe() {
+            Some(r) => r.cameras(),
+            None => (0..host(&self.app).camera.len() as u8).collect(),
+        }
+    }
+
+    fn publish(&mut self) {
+        self.dirty = false;
+        self.published = Instant::now();
+        let host = host(&self.app);
+        let active = self.current_recipe();
         let snapshot = Snapshot {
             phase: self.phase,
             since: self.since,
             fault: self.fault.clone(),
-            product_source: settings.product_source,
+            product_source: host.settings().product_source,
             active_recipe_id: active.as_ref().map(|r| r.id.clone()),
             trigger_mode: active.as_ref().map(|r| r.trigger_mode),
+            mode: active.as_ref().map(|r| r.mode),
             part: self.part.as_ref().map(Part::view),
             result: self.result.clone(),
             stats: self.stats.clone(),
             stray_frames: self.stray,
             alarms: self.alarms.clone(),
-            camera: host.camera.status(),
+            cameras: host.camera.statuses(),
         };
         host.shared.lock().unwrap().snapshot = Some(snapshot.clone());
         let _ = self.app.emit("cycle://snapshot", snapshot);
@@ -402,7 +492,6 @@ impl Machine {
         match input {
             Input::Edge(e) if e.rising => self.on_edge(e).await,
             Input::Edge(_) => {}
-            Input::Frame(f) => self.on_frame(f),
             Input::Measured(m) => self.on_measured(m),
             Input::Reset => self.reset().await,
             Input::Refresh => {}
@@ -428,7 +517,11 @@ impl Machine {
         } else if has(tag::RESULT_ACK) {
             if self.phase == Phase::Report {
                 let a = self.app.clone();
-                let r = async { put(&a, tag::DONE, json!(false)).await?; put(&a, tag::BUSY, json!(false)).await }.await;
+                let r = async {
+                    put(&a, tag::DONE, json!(false)).await?;
+                    put(&a, tag::BUSY, json!(false)).await
+                }
+                .await;
                 if let Err(e) = r {
                     self.alarm(format!("写 PLC 失败：{e}"));
                 }
@@ -458,7 +551,7 @@ impl Machine {
         let host = host(&app);
         let settings = host.settings();
         let recipe = match settings.product_source {
-            ProductSource::Plc => host.recipes.iter().find(|r| r.product_code as u32 == code).cloned(),
+            ProductSource::Plc => host.recipes.list().into_iter().find(|r| r.product_code as u32 == code),
             ProductSource::Manual => settings.manual_recipe_id.as_deref().and_then(|id| host.recipe(id)),
         };
         let Some(recipe) = recipe else {
@@ -471,23 +564,39 @@ impl Machine {
         };
         self.active_recipe = Some(recipe.clone());
         let n = recipe.shot_count();
-        if count != n {
+        let follow = recipe.mode == InspectMode::Follow;
+        if !follow && count != n {
             let reason = format!("PLC 下发拍照点数 {count}，配方 {} 为 {n}", recipe.id);
             log(&app, "err", "校验失败", format!("{reason}，不布防"));
             return self.report(sn, Some(recipe.id.clone()), Judgement::error(fault::SHOT_COUNT_MISMATCH, reason)).await;
         }
-
-        let cam = host.camera.status();
-        if !cam.ready {
-            let reason = format!("相机未就绪：{}", cam.message);
+        if let Err(reason) = host.camera.check_ready(&recipe.cameras()) {
             log(&app, "err", "校验失败", format!("{reason}，不布防"));
             return self.report(sn, Some(recipe.id.clone()), Judgement::error(fault::DEVICE_LOST, reason)).await;
         }
+        let tracker = if follow {
+            let cams: Vec<_> = recipe.cameras().into_iter().filter_map(|c| host.camera.slot(c as usize).and_then(|s| s.config().follow).map(|f| (c, f))).collect();
+            if cams.len() < recipe.cameras().len() {
+                let reason = "有随动相机没做胶嘴标定（图像源页 → 随动标定）".to_string();
+                log(&app, "err", "校验失败", format!("{reason}，不布防"));
+                return self.report(sn, Some(recipe.id.clone()), Judgement::error(fault::NO_RECIPE, reason)).await;
+            }
+            match Tracker::new(recipe.clone(), cams, now_ms()) {
+                Ok(t) => Some(t),
+                Err(reason) => {
+                    log(&app, "err", "校验失败", format!("{reason}，不布防"));
+                    return self.report(sn, Some(recipe.id.clone()), Judgement::error(fault::NO_RECIPE, reason)).await;
+                }
+            }
+        } else {
+            None
+        };
+        let recording = host.recorder.begin(settings.record, sn, recipe.clone());
         self.part = Some(Part {
             sn,
             scenario: host.sim.part_scenario(),
-            frames: vec![FrameView::waiting(); n],
-            measuring_since: vec![None; n],
+            frames: if follow { Vec::new() } else { vec![FrameView::waiting(); n] },
+            measuring_since: if follow { Vec::new() } else { vec![None; n] },
             table: vec![PointState::Pending; recipe.point_count()],
             received: 0,
             extra: 0,
@@ -499,15 +608,33 @@ impl Machine {
             armed_at: Instant::now(),
             end_at: None,
             fault: None,
+            follow: tracker,
+            jobs: HashMap::new(),
+            nozzle_s: None,
+            active_cam: None,
+            last_error: None,
+            recording,
             recipe: recipe.clone(),
         });
-        let r = async { put(&app, tag::ARMED, json!(true)).await?; put(&app, tag::BUSY, json!(true)).await }.await;
+        if follow {
+            host.camera.set_streaming(true);
+        }
+        let r = async {
+            put(&app, tag::ARMED, json!(true)).await?;
+            put(&app, tag::BUSY, json!(true)).await
+        }
+        .await;
         if let Err(e) = r {
             self.alarm(format!("写 PLC 失败：{e}"));
         }
+        // 按时间推算胶嘴位置的起点：armed 写进 PLC 的时刻（机器人看到 armed 的延迟由起步延时与起点同步吸收）
+        if let Some(t) = self.part.as_mut().and_then(|p| p.follow.as_mut()) {
+            t.armed_ts = now_ms();
+        }
         self.set_phase(Phase::Acquire);
         let elapsed = t0.elapsed();
-        log(&app, "info", "armed↑ busy↑", format!("{} · N={n} · 布防耗时 {} ms", recipe.id, elapsed.as_millis()));
+        let what = if follow { format!("随动 · {} 台相机", recipe.cameras().len()) } else { format!("N={n}") };
+        log(&app, "info", "armed↑ busy↑", format!("{} · {what} · 布防耗时 {} ms", recipe.id, elapsed.as_millis()));
         if elapsed > host.settings().timeouts.arm() {
             log(&app, "warn", "布防慢", format!("超过 T_arm {} ms", host.settings().timeouts.arm_ms));
         }
@@ -515,17 +642,37 @@ impl Machine {
 
     fn on_frame(&mut self, f: Frame) {
         let accepting = matches!(self.phase, Phase::Acquire | Phase::Drain);
-        let Some(part) = self.part.as_mut().filter(|_| accepting) else {
+        let free_run = host(&self.app).camera.slot(f.cam as usize).is_some_and(|s| s.config().acquisition == Acquisition::FreeRun);
+        if (!accepting || self.part.is_none()) && free_run {
+            // 连续采集的相机在工件结束的那一刻还会有一两帧在路上，不算游离帧
+            return;
+        }
+        if !accepting || self.part.is_none() {
             self.stray += 1;
+            self.dirty = true;
             let now = Instant::now();
             self.stray_times.push_back(now);
             self.stray_times.retain(|t| now.duration_since(*t) < Duration::from_secs(60));
-            log(&self.app, "warn", "游离帧", format!("空闲时收到帧（帧计数 {}），已丢弃", f.frame_counter));
+            log(&self.app, "warn", "游离帧", format!("空闲时收到相机 {} 的帧（帧计数 {}），已丢弃", f.cam + 1, f.frame_counter));
             if self.stray_times.len() >= 3 {
                 self.alarm("1 分钟内游离帧 ≥ 3，检查 Line0 接线与输入滤波".into());
             }
             return;
-        };
+        }
+        {
+            let part = self.part.as_mut().unwrap();
+            if !part.recipe.cameras().contains(&f.cam) {
+                return;
+            }
+            if let Some(rec) = part.recording.as_mut() {
+                host(&self.app).recorder.frame(rec, &f);
+            }
+            if part.follow() {
+                return self.on_follow_frame(f);
+            }
+        }
+        self.dirty = true;
+        let part = self.part.as_mut().unwrap();
         part.received += 1;
         // 本件第一帧为 k=0；之后按帧计数的增量推进，中途丢帧时后续帧仍落到正确的拍照点上（整件仍判漏帧）。
         let (k, jump) = match part.prev {
@@ -543,6 +690,7 @@ impl Machine {
         }
         part.frames[k] = FrameView {
             status: FrameStatus::Measuring,
+            cam: f.cam,
             arrived_ms: Some(part.armed_at.elapsed().as_millis() as u64),
             frame_counter: Some(f.frame_counter - first),
             trigger_counter: Some(f.trigger_counter.saturating_sub(base_trigger)),
@@ -551,7 +699,7 @@ impl Machine {
         };
         part.measuring_since[k] = Some(Instant::now());
         part.queue += 1;
-        let _ = self.measure_tx.send(Job { sn: part.sn, k, recipe: part.recipe.clone(), scenario: part.scenario, image: f.image.clone() });
+        let job = Job { sn: part.sn, k, cam: f.cam, recipe: part.recipe.clone(), scenario: part.scenario, image: f.image.clone(), kind: JobKind::Shot { k } };
         let lost = if f.lost_packets > 0 { format!(" · 丢包 {}", f.lost_packets) } else { String::new() };
         let msg = format!(
             "k={k} · Chunk 帧 {} 触发 {}{}{lost}",
@@ -560,18 +708,136 @@ impl Machine {
             if jump { "（帧计数跳号）" } else { "" }
         );
         log(&self.app, if jump { "err" } else { "info" }, "帧到达", msg);
+        self.submit(job);
+    }
+
+    /// 随动一帧：推算胶嘴位置，这台相机是此刻最合适的、且窗口里攒够了新胶条才测。
+    fn on_follow_frame(&mut self, f: Frame) {
+        let app = self.app.clone();
+        let Some(part) = self.part.as_mut() else { return };
+        part.received += 1;
+        let progress = read_tag_f32_ts(plc(&app), tag::PATH_PROGRESS);
+        let tracker = part.follow.as_mut().unwrap();
+        let Some(s) = tracker.nozzle_s(f.ts, progress) else {
+            if part.last_error.is_none() {
+                part.last_error = Some("PLC 地址表里没有 pathProgress 点位，按进度定位需要它".into());
+                log(&app, "err", "随动", part.last_error.clone().unwrap());
+            }
+            return;
+        };
+
+        let changed = part.nozzle_s.is_none_or(|p| (p - s).abs() > 0.5);
+        part.nozzle_s = Some(s);
+        if part.follow.as_mut().unwrap().start_given_up(s) {
+            log(&app, "warn", "起点同步", "胶条起点出窗口前没找到，按推算位置继续（检查起步延时）");
+        }
+
+        let Some(plan) = part.follow.as_mut().unwrap().plan(f.cam, s) else {
+            self.dirty |= changed;
+            return;
+        };
+        let calib = host(&app).camera.slot(f.cam as usize).and_then(|c| c.config().follow);
+        let Some(calib) = calib else {
+            part.follow.as_mut().unwrap().release(&plan.points);
+            return;
+        };
+        let k = part.frames.len();
+        part.frames.push(FrameView {
+            status: FrameStatus::Measuring,
+            cam: f.cam,
+            s: Some(s),
+            arrived_ms: Some(part.armed_at.elapsed().as_millis() as u64),
+            frame_counter: Some(f.frame_counter),
+            trigger_counter: Some(f.trigger_counter),
+            points: plan.points.len(),
+            ..FrameView::waiting()
+        });
+        part.measuring_since.push(Some(Instant::now()));
+        let generation = part.follow.as_ref().map_or(0, |t| t.generation);
+        part.jobs.insert(k, (plan.points.clone(), generation));
+        part.active_cam = Some(f.cam);
+        part.queue += 1;
+        let job = Job {
+            sn: part.sn,
+            k,
+            cam: f.cam,
+            recipe: part.recipe.clone(),
+            scenario: part.scenario,
+            image: f.image.clone(),
+            kind: JobKind::Follow { s, points: plan.points, calib, start_probe: plan.start_probe },
+        };
+        self.dirty = true;
+        self.submit(job);
+    }
+
+    /// 送测量队列；队列满了这一帧直接记为测量出错。
+    fn submit(&mut self, job: Job) {
+        self.dirty = true;
+        match self.measure_tx.try_send(job) {
+            Ok(()) => {}
+            Err(TrySendError::Full(job)) | Err(TrySendError::Closed(job)) => {
+                self.on_measured(Measured::failed(&job, "测量队列已满：测量跟不上帧率"));
+            }
+        }
     }
 
     fn on_measured(&mut self, m: Measured) {
         let Some(part) = self.part.as_mut().filter(|p| p.sn == m.sn) else { return };
-        let frame = &mut part.frames[m.k];
+        let Some(frame) = part.frames.get_mut(m.k) else { return };
         if frame.status != FrameStatus::Measuring {
             return;
         }
         part.queue -= 1;
         part.measuring_since[m.k] = None;
+        let follow = part.follow.is_some();
+        let mut sync_log = None;
+        let (assigned, job_gen) = part.jobs.remove(&m.k).unwrap_or_default();
+        if follow {
+            let now_s = part.nozzle_s.unwrap_or(0.0);
+            let t = part.follow.as_mut().unwrap();
+            if m.start_probe {
+                let candidates = t.apply_start(m.start_sync, now_s);
+                if let Some(d) = m.start_sync {
+                    // 同步前按错的位置测过的点里，起点附近与测成缺胶的是测坏的，清掉重测；
+                    // 其余在直线段上沿胶路错一点不影响读数，留着（它们可能已经出了窗口，清掉就补不回来了）
+                    let sp = part.recipe.spacing;
+                    let reset: Vec<u32> = candidates
+                        .into_iter()
+                        .filter(|&j| (j as f32 * sp) < d.abs() + 2.0 || part.table[j as usize] == PointState::Gap)
+                        .collect();
+                    for &j in &reset {
+                        part.table[j as usize] = PointState::Pending;
+                    }
+                    t.release(&reset);
+                    let ms = match part.recipe.follow.as_ref().map(|f| &f.timing) {
+                        Some(FollowTiming::Timed { speed_mm_s, .. }) => format!("，约合起步延时 {:+.0} ms", d / speed_mm_s * 1000.0),
+                        _ => String::new(),
+                    };
+                    sync_log = Some(format!("胶嘴位置修正 {:+.1} mm{ms}，重测起点附近 {} 点", -d, reset.len()));
+                }
+            }
+        }
+        // 起点同步之前发出去、按旧位置测的帧：起点附近与测成缺胶的点不要、放回去重测，其余照收
+        let stale_delta = part.follow.as_ref().filter(|t| job_gen < t.generation).map(|t| t.start_delta.abs());
+        let stale = stale_delta.is_some();
+        let sp = part.recipe.spacing;
+        let mut redo = Vec::new();
         for (i, &j) in m.idx.iter().enumerate() {
-            part.table[j as usize] = m.point_state(i);
+            let st = m.point_state(i);
+            if stale_delta.is_some_and(|d| (j as f32 * sp) < d + 2.0 || st == PointState::Gap || st == PointState::Invalid) {
+                redo.push(j);
+                continue;
+            }
+            // 随动：测不成的点不覆盖别的帧已经测到的值
+            if !(follow && st == PointState::Invalid && part.table[j as usize] != PointState::Pending) {
+                part.table[j as usize] = st;
+            }
+        }
+        if let (true, Some(t)) = (stale, part.follow.as_mut()) {
+            t.release(&redo);
+            if m.error.is_some() {
+                t.release(&assigned);
+            }
         }
         let gaps = m.st.iter().filter(|&&s| s == measure::ST_GAP).count();
         frame.status = if m.error.is_some() {
@@ -582,46 +848,76 @@ impl Machine {
             FrameStatus::LocateFailed
         };
         frame.score = (m.error.is_none()).then_some(m.score);
-        frame.points = m.idx.len();
+        frame.points = if m.error.is_some() { frame.points } else { m.idx.len() };
         frame.gap_points = gaps;
         frame.ms = Some(m.ms);
-        if let Some(e) = &m.error {
+        if follow && !stale {
+            let retry: Vec<u32> = if m.error.is_some() {
+                assigned
+            } else {
+                m.idx.iter().zip(&m.st).filter(|(_, &s)| s == ST_INVALID).map(|(&j, _)| j).collect()
+            };
+            if let Some(t) = part.follow.as_mut() {
+                t.release(&retry);
+                if let Some(d) = m.lateral_sync {
+                    t.apply_lateral(d);
+                }
+            }
+            if let Some(e) = &m.error {
+                part.last_error = Some(e.clone());
+            }
+        } else if let Some(e) = &m.error {
             if part.fault.is_none() {
                 part.fault = Some((fault::PROCESS_TIMEOUT, format!("帧 k={} 测量出错：{e}", m.k)));
             }
         }
+        let cam = if follow { format!("相机 {} · ", m.cam + 1) } else { String::new() };
         let (level, ev, msg) = if let Some(e) = &m.error {
-            ("err", "测量出错", format!("k={} · {e}", m.k))
+            ("err", "测量出错", format!("{cam}k={} · {e}", m.k))
         } else if m.located {
             let extra = if gaps > 0 { format!(" · 缺胶 {gaps} 点") } else { String::new() };
-            (if gaps > 0 { "ng" } else { "info" }, "测量完成", format!("k={} 分数 {:.2} · {} 点 · {} ms{extra}", m.k, m.score, m.idx.len(), m.ms))
+            let at = m.s.map(|s| format!(" · s={s:.1}")).unwrap_or_default();
+            (if gaps > 0 { "ng" } else { "info" }, "测量完成", format!("{cam}k={}{at} 分数 {:.2} · {} 点 · {} ms{extra}", m.k, m.score, m.idx.len(), m.ms))
         } else {
             ("err", "定位失败", format!("k={} 匹配分数 {:.2} < 0.60", m.k, m.score))
         };
-        log(&self.app, level, ev, msg);
+        // 随动每秒测十几帧，正常的"测量完成"不刷日志
+        if !(follow && level == "info") {
+            log(&self.app, level, ev, msg);
+        }
+        if let Some(msg) = sync_log {
+            log(&self.app, "info", "起点同步", msg);
+        }
         let _ = self.app.emit("cycle://frame", &m);
         host(&self.app).shared.lock().unwrap().measured.push(m);
     }
 
     async fn on_tick(&mut self) {
         let connected = plc(&self.app).status().state == LinkState::Connected;
-        let camera = host(&self.app).camera.status();
+        let cameras = host(&self.app).camera.check_ready(&self.required_cams());
+        let dropped: u64 = host(&self.app).camera.statuses().iter().map(|c| c.dropped_frames).sum();
+        if dropped > self.dropped_seen {
+            log(&self.app, "warn", "丢帧", format!("帧通道满，累计丢弃 {dropped} 帧：检测节拍处理不过来"));
+            self.dropped_seen = dropped;
+        }
         if self.phase != Phase::Fault {
             if !connected {
                 return self.enter_fault("PLC 未连接".into());
             }
-            if !camera.ready {
-                return self.enter_fault(format!("相机未就绪：{}", camera.message));
+            if let Err(e) = &cameras {
+                return self.enter_fault(format!("相机未就绪：{e}"));
             }
         }
-        if self.phase == Phase::Fault && !camera.ready {
-            let reason = format!("相机未就绪：{}", camera.message);
-            if self.fault.as_deref() != Some(reason.as_str()) && self.fault.as_deref().is_some_and(|f| f.starts_with("相机")) {
-                self.fault = Some(reason);
-                self.dirty = true;
+        if self.phase == Phase::Fault {
+            if let Err(e) = &cameras {
+                let reason = format!("相机未就绪：{e}");
+                if self.fault.as_deref() != Some(reason.as_str()) && self.fault.as_deref().is_some_and(|f| f.starts_with("相机")) {
+                    self.fault = Some(reason);
+                    self.dirty = true;
+                }
             }
         }
-        let connected = connected && camera.ready;
+        let connected = connected && cameras.is_ok();
         let timeouts = host(&self.app).settings().timeouts;
         match self.phase {
             Phase::Fault if connected && !self.fault_needs_reset => self.recover().await,
@@ -636,13 +932,20 @@ impl Machine {
             }
             Phase::Drain => {
                 let Some(part) = self.part.as_mut() else { return };
-                let frames_done = part.received >= part.n() || part.end_at.is_some_and(|t| t.elapsed() > timeouts.drain());
+                // 随动：partEnd 之后在路上的帧 200 ms 内都会到
+                let frames_done = if part.follow() {
+                    part.end_at.is_some_and(|t| t.elapsed() > Duration::from_millis(200))
+                } else {
+                    part.received >= part.n() || part.end_at.is_some_and(|t| t.elapsed() > timeouts.drain())
+                };
                 let stuck = part.measuring_since.iter().flatten().any(|t| t.elapsed() > timeouts.proc());
                 if stuck && part.fault.is_none() {
                     part.fault = Some((fault::PROCESS_TIMEOUT, format!("单帧测量超过 T_proc {} ms", timeouts.proc_ms)));
                 }
                 if frames_done && (part.queue == 0 || stuck) {
-                    if part.received < part.n() {
+                    if part.follow() {
+                        log(&self.app, "info", "随动结束", format!("收到 {} 帧，测 {} 帧", part.received, part.frames.len()));
+                    } else if part.received < part.n() {
                         let msg = format!("T_drain {} ms：帧 {}/{}", timeouts.drain_ms, part.received, part.n());
                         log(&self.app, "err", "收尾超时", msg);
                     } else {
@@ -669,31 +972,55 @@ impl Machine {
 
     async fn judge_part(&mut self) {
         self.set_phase(Phase::Judge);
+        host(&self.app).camera.set_streaming(false);
         let Some(part) = self.part.as_mut() else { return };
-        let n = part.n();
-        let mut missing = Vec::new();
-        for (k, f) in part.frames.iter_mut().enumerate() {
-            if matches!(f.status, FrameStatus::Waiting | FrameStatus::Measuring) {
-                if f.status == FrameStatus::Waiting {
-                    missing.push(k);
-                }
+        let judgement = if part.follow() {
+            // 随动：没分到帧、或重测后仍测不成的点记为无效，交给判定按长度决定
+            for p in part.table.iter_mut().filter(|p| **p == PointState::Pending) {
+                *p = PointState::Invalid;
+            }
+            for f in part.frames.iter_mut().filter(|f| f.status == FrameStatus::Measuring) {
                 f.status = FrameStatus::Missing;
             }
-        }
-        let triggers = part.triggers();
-        let judgement = if let Some((code, reason)) = part.fault.clone() {
-            Judgement::error(code, reason)
-        } else if !missing.is_empty() {
-            let ks = missing.iter().map(|k| format!("k={k}")).collect::<Vec<_>>().join("、");
-            let cause = if triggers as usize >= n { "触发已到，传输丢帧" } else { "可能触发丢失" };
-            Judgement::error(fault::MISSING_FRAME, format!("帧 {ks} 未收到：触发计数 {triggers}，收到 {}/{n}，{cause}", part.received))
-        } else if part.extra > 0 {
-            Judgement::error(fault::EXTRA_FRAME, format!("多收到 {} 帧，无法确定对应关系", part.extra))
-        } else if let Some(k) = part.frames.iter().position(|f| f.status == FrameStatus::LocateFailed) {
-            let score = part.frames[k].score.unwrap_or(0.0);
-            Judgement::error(fault::LOCATE_FAILED, format!("帧 k={k} 定位失败：匹配分数 {score:.2} < 0.60"))
+            match part.fault.clone() {
+                Some((code, reason)) => Judgement::error(code, reason),
+                None if part.frames.is_empty() => Judgement::error(fault::MISSING_FRAME, format!("随动期间收到 {} 帧，没有一帧落在可测窗口里：检查标定与节拍", part.received)),
+                None => {
+                    let mut j = judge::judge(&part.recipe, &part.table);
+                    if j.fault_code == fault::INVALID_POINTS {
+                        if let Some(e) = &part.last_error {
+                            j.reason = format!("{}（测量出错：{e}）", j.reason);
+                        }
+                    }
+                    j
+                }
+            }
         } else {
-            judge::judge(&part.recipe, &part.table)
+            let n = part.n();
+            let mut missing = Vec::new();
+            for (k, f) in part.frames.iter_mut().enumerate() {
+                if matches!(f.status, FrameStatus::Waiting | FrameStatus::Measuring) {
+                    if f.status == FrameStatus::Waiting {
+                        missing.push(k);
+                    }
+                    f.status = FrameStatus::Missing;
+                }
+            }
+            let triggers = part.triggers();
+            if let Some((code, reason)) = part.fault.clone() {
+                Judgement::error(code, reason)
+            } else if !missing.is_empty() {
+                let ks = missing.iter().map(|k| format!("k={k}")).collect::<Vec<_>>().join("、");
+                let cause = if triggers as usize >= n { "触发已到，传输丢帧" } else { "可能触发丢失" };
+                Judgement::error(fault::MISSING_FRAME, format!("帧 {ks} 未收到：触发计数 {triggers}，收到 {}/{n}，{cause}", part.received))
+            } else if part.extra > 0 {
+                Judgement::error(fault::EXTRA_FRAME, format!("多收到 {} 帧，无法确定对应关系", part.extra))
+            } else if let Some(k) = part.frames.iter().position(|f| f.status == FrameStatus::LocateFailed) {
+                let score = part.frames[k].score.unwrap_or(0.0);
+                Judgement::error(fault::LOCATE_FAILED, format!("帧 k={k} 定位失败：匹配分数 {score:.2} < 0.60"))
+            } else {
+                judge::judge(&part.recipe, &part.table)
+            }
         };
         let (sn, id) = (part.sn, part.recipe.id.clone());
         self.report(sn, Some(id), judgement).await;
@@ -724,14 +1051,27 @@ impl Machine {
         let fault = if judgement.fault_code > 0 { format!(" faultCode={}", judgement.fault_code) } else { String::new() };
         log(&app, level, "回写", format!("resultCode={}{fault} resultSn={sn} done↑ · {}", judgement.plc_code, judgement.reason));
         let drain_ms = self.part.as_ref().and_then(|p| p.end_at).map(|t| t.elapsed().as_millis() as u64);
+        self.finish_recording(sn, &judgement);
         self.record(sn, recipe_id.as_deref(), &judgement, drain_ms);
         self.result = Some(ResultView { sn, recipe_id, ts: now_ms(), drain_ms, judgement });
+    }
+
+    fn finish_recording(&mut self, sn: u32, judgement: &Judgement) {
+        let Some(rec) = self.part.as_mut().filter(|p| p.sn == sn).and_then(|p| p.recording.take()) else { return };
+        let host = host(&self.app);
+        let settings = host.settings();
+        host.recorder.finish(rec, judgement.verdict, &judgement.reason, settings.record_keep, (settings.record_max_gb as f64 * 1e9) as u64);
     }
 
     fn record(&self, sn: u32, recipe_id: Option<&str>, judgement: &Judgement, drain_ms: Option<u64>) {
         let part = self.part.as_ref().filter(|p| p.sn == sn);
         let recipe = part.map(|p| p.recipe.clone()).or_else(|| recipe_id.and_then(|id| host(&self.app).recipe(id)));
         let frames = part.map(|p| p.frames.clone()).unwrap_or_default();
+        let frames_expected = match (part, &recipe) {
+            (Some(p), _) if p.follow() => p.frames.len(),
+            (_, Some(r)) => r.shot_count(),
+            _ => 0,
+        };
         let table = part.map(|p| p.table.clone()).filter(|t| t.iter().any(|x| *x != PointState::Pending));
         let (received, triggers) = part.map_or((0, 0), |p| (p.received, p.triggers()));
         let judgement = judgement.clone();
@@ -745,6 +1085,7 @@ impl Machine {
                 judgement: &judgement,
                 drain_ms,
                 frames: &frames,
+                frames_expected,
                 frames_received: received,
                 triggers,
                 table: table.as_deref(),
@@ -777,19 +1118,15 @@ impl Machine {
 
     fn enter_fault(&mut self, reason: String) {
         let in_flight = matches!(self.phase, Phase::Validate | Phase::Acquire | Phase::Drain | Phase::Judge);
+        host(&self.app).camera.set_streaming(false);
         if in_flight {
             let sn = self.part.as_ref().map_or(0, |p| p.sn);
             let judgement = Judgement::error(fault::DEVICE_LOST, format!("{reason}，结果未回写"));
             self.count(judgement.verdict);
+            self.finish_recording(sn, &judgement);
             self.record(sn, self.part.as_ref().map(|p| p.recipe.id.clone()).as_deref(), &judgement, None);
             log(&self.app, "err", "在途件中断", format!("SN {sn} 记 ERR 98，需人工处理该件"));
-            self.result = Some(ResultView {
-                sn,
-                recipe_id: self.part.as_ref().map(|p| p.recipe.id.clone()),
-                ts: now_ms(),
-                drain_ms: None,
-                judgement,
-            });
+            self.result = Some(ResultView { sn, recipe_id: self.part.as_ref().map(|p| p.recipe.id.clone()), ts: now_ms(), drain_ms: None, judgement });
         }
         self.fault_needs_reset = in_flight;
         log(&self.app, "err", "故障", reason.clone());
@@ -827,7 +1164,7 @@ impl Machine {
         }
         self.fault_needs_reset = false;
         log(&self.app, "info", "故障复位", "");
-        if plc(&self.app).status().state == LinkState::Connected && host(&self.app).camera.status().ready {
+        if plc(&self.app).status().state == LinkState::Connected && host(&self.app).camera.check_ready(&self.required_cams()).is_ok() {
             self.recover().await;
         }
     }
@@ -850,19 +1187,7 @@ pub fn cycle_part_data(cycle: State<'_, CycleHost>) -> Vec<Measured> {
 
 #[tauri::command]
 pub fn cycle_recipes(cycle: State<'_, CycleHost>) -> Vec<RecipeSummary> {
-    cycle
-        .recipes
-        .iter()
-        .map(|r| RecipeSummary {
-            id: r.id.clone(),
-            name: r.name.clone(),
-            version: r.version,
-            hash: r.hash.clone(),
-            product_code: r.product_code,
-            shot_count: r.shot_count(),
-            trigger_mode: r.trigger_mode,
-        })
-        .collect()
+    cycle.recipes.list().iter().map(|r| RecipeSummary::from(&**r)).collect()
 }
 
 #[tauri::command]
@@ -877,14 +1202,11 @@ pub fn cycle_get_settings(cycle: State<'_, CycleHost>) -> CycleSettings {
 
 #[tauri::command]
 pub fn cycle_save_settings(app: AppHandle, cycle: State<'_, CycleHost>, settings: CycleSettings) -> Result<(), String> {
-    settings.validate()?;
     if let Some(id) = &settings.manual_recipe_id {
         cycle.recipe(id).ok_or("配方不存在")?;
     }
-    settings.save(&cycle.settings_path)?;
-    cycle.shared.lock().unwrap().settings = settings;
-    let _ = cycle.tx.send(Input::Refresh);
-    tauri::async_runtime::spawn_blocking(move || crate::vision::apply_settings(&app));
+    cycle.save_settings(settings)?;
+    measure::apply_settings(&app);
     Ok(())
 }
 

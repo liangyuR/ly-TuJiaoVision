@@ -4,7 +4,7 @@ import { plcApi, usePlcStatus } from "../../plc";
 import { cycleApi, useRecipes, useSimStatus } from "../api";
 import type { Scenario } from "../types";
 
-const scenarios: [Scenario, string][] = [
+const flyScenarios: [Scenario, string][] = [
   ["normal", "正常件"],
   ["excursion", "局部超差（允许）"],
   ["gap", "跨帧断胶"],
@@ -12,6 +12,14 @@ const scenarios: [Scenario, string][] = [
   ["locateFail", "定位失败"],
   ["countMismatch", "拍照点数不一致"],
   ["random", "随机（连续运行用）"],
+];
+
+const followScenarios: [Scenario, string][] = [
+  ["normal", "正常件"],
+  ["excursion", "胶条偏位"],
+  ["gap", "断胶 5 mm（胶头圆角后约 3 mm）"],
+  ["narrow", "胶宽不足"],
+  ["lostFrame", "间歇丢帧"],
 ];
 
 export default function SimControls({ compact = false }: { compact?: boolean }) {
@@ -30,6 +38,12 @@ export default function SimControls({ compact = false }: { compact?: boolean }) 
     if (!recipeId && recipes.length) setRecipeId(recipes[0].id);
   }, [recipes, recipeId]);
 
+  const follow = recipes.find((r) => r.id === recipeId)?.mode === "follow";
+  const scenarios = follow ? followScenarios : flyScenarios;
+  useEffect(() => {
+    if (!scenarios.some(([v]) => v === scenario)) setScenario("normal");
+  }, [scenarios, scenario]);
+
   if (!isSim) {
     return compact ? null : <p className="muted">模拟节拍需要把 PLC 协议设为“模拟器”并连接。</p>;
   }
@@ -46,7 +60,7 @@ export default function SimControls({ compact = false }: { compact?: boolean }) 
       <select id="sim-recipe" className="input" value={recipeId} onChange={(e) => setRecipeId(e.target.value)} disabled={running}>
         {recipes.map((r) => (
           <option key={r.id} value={r.id}>
-            {r.id} · 代码 {r.productCode} · N={r.shotCount}
+            {r.id} · 代码 {r.productCode} · {r.mode === "follow" ? `随动 ${r.cameras.length} 相机` : `N=${r.shotCount}`}
           </option>
         ))}
       </select>

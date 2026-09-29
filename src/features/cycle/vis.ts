@@ -1,4 +1,4 @@
-import type { Judgement, Measured, PartView, PointVis, Recipe } from "./types";
+import type { JudgeParams, Judgement, Measured, PartView, PointVis, Recipe } from "./types";
 
 export const visColor: Record<PointVis, string> = {
   none: "#3b4a66",
@@ -10,6 +10,11 @@ export const visColor: Record<PointVis, string> = {
   miss: "#a78bfa",
 };
 
+/** 相机在各处的代表色（相机窗、主视图上的测量归属）。 */
+export const CAM_COLORS = ["#38bdf8", "#f472b6", "#facc15", "#34d399", "#fb923c", "#818cf8", "#2dd4bf", "#e879f9"];
+
+const outside = (v: number, p: JudgeParams) => v < p.nominal - p.tolLower || v > p.nominal + p.tolUpper;
+
 export function computeVis(layout: Recipe, part: PartView | null, measured: Measured[], result: Judgement | null): PointVis[] {
   const n = layout.points.k.length;
   const vis: PointVis[] = new Array(n).fill("none");
@@ -18,22 +23,27 @@ export function computeVis(layout: Recipe, part: PartView | null, measured: Meas
     m.idx.forEach((j, i) => {
       const st = m.st[i];
       if (st === 1) vis[j] = "gap";
-      else if (st === 2) vis[j] = "inv";
-      else {
-        const p = layout.segments[layout.points.seg[j]].params;
-        const d = m.d[i];
-        vis[j] = d < p.nominal - p.tolLower || d > p.nominal + p.tolUpper ? "exc" : "ok";
+      else if (st === 2) {
+        // 随动里测不成的点会重测，已经有值的不回退成"未测成"
+        if (vis[j] === "none") vis[j] = "inv";
+      } else {
+        const seg = layout.segments[layout.points.seg[j]];
+        const w = m.w?.[i];
+        const bad = outside(m.d[i], seg.params) || (seg.width != null && w != null && outside(w, seg.width));
+        vis[j] = bad ? "exc" : "ok";
       }
     });
   }
-  part.frames.forEach((f, k) => {
-    if (f.status !== "missing") return;
-    layout.points.k.forEach((owner, j) => {
-      if (owner === k && vis[j] === "none") vis[j] = "miss";
+  if (layout.mode === "flyShot") {
+    part.frames.forEach((f, k) => {
+      if (f.status !== "missing") return;
+      layout.points.k.forEach((owner, j) => {
+        if (owner === k && vis[j] === "none") vis[j] = "miss";
+      });
     });
-  });
+  }
   result?.segments.forEach((s, gi) => {
-    if (s.verdict !== "NG_POSITION" && s.verdict !== "NG_ABSOLUTE") return;
+    if (s.verdict !== "NG_POSITION" && s.verdict !== "NG_ABSOLUTE" && s.verdict !== "NG_WIDTH") return;
     layout.points.seg.forEach((seg, j) => {
       if (seg === gi && vis[j] === "exc") vis[j] = "ng";
     });
@@ -47,7 +57,7 @@ export interface Run {
   to: number;
 }
 
-/** 按显示状态把闭合胶路切成连续段，末段与首段相连。 */
+/** 按显示状态把胶路切成连续段。 */
 export function runs(vis: PointVis[]): Run[] {
   const out: Run[] = [];
   vis.forEach((v, j) => {
@@ -73,4 +83,30 @@ export function currentFrame(part: PartView | null) {
     if (f.status !== "waiting" && f.status !== "missing") k = i;
   });
   return k;
+}
+
+/** 弧长 s 处的名义位置（与后端 Recipe::pos 一致）。 */
+export function posAt(layout: Recipe, s: number): [number, number] {
+  const { x, y } = layout.points;
+  const n = x.length;
+  if (!n) return [0, 0];
+  const sp = layout.spacing;
+  if (layout.closed) {
+    const L = n * sp;
+    const t = (((s % L) + L) % L) / sp;
+    const j = Math.min(Math.floor(t), n - 1);
+    const f = t - j;
+    const b = (j + 1) % n;
+    return [x[j] + (x[b] - x[j]) * f, y[j] + (y[b] - y[j]) * f];
+  }
+  const t = s / sp;
+  const j = Math.max(0, Math.min(Math.floor(t), n - 2));
+  const f = t - j;
+  return [x[j] + (x[j + 1] - x[j]) * f, y[j] + (y[j + 1] - y[j]) * f];
+}
+
+/** 胶路包围盒 [x0, y0, x1, y1]。 */
+export function bounds(layout: Recipe): [number, number, number, number] {
+  const { x, y } = layout.points;
+  return [Math.min(...x), Math.min(...y), Math.max(...x), Math.max(...y)];
 }

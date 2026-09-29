@@ -1,13 +1,15 @@
 use serde::{Deserialize, Serialize};
 
-use crate::recipe::Recipe;
+use crate::recipe::{InspectMode, JudgeParams, Recipe};
 
+/// 声明顺序即严重程度，整件结果取各段最严重的一个。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Verdict {
     Ok,
     OkWithExcursion,
     NgPosition,
+    NgWidth,
     NgAbsolute,
     NgGap,
     ErrInspect,
@@ -21,6 +23,7 @@ impl Verdict {
             Verdict::NgPosition => 11,
             Verdict::NgAbsolute => 12,
             Verdict::NgGap => 13,
+            Verdict::NgWidth => 14,
             Verdict::ErrInspect => 90,
         }
     }
@@ -41,11 +44,19 @@ pub mod fault {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PointState {
     Pending,
-    Measured(f32),
+    /// d：位置量；w：胶宽（没测胶宽时为 NaN）
+    Measured { d: f32, w: f32 },
     /// 找到内边但未找到胶条
     Gap,
-    /// 内边未找到，该点测不了
+    /// 该点测不了（内边未找到、被遮挡、出了图像）
     Invalid,
+}
+
+impl PointState {
+    #[cfg(test)]
+    pub fn measured(d: f32) -> Self {
+        PointState::Measured { d, w: f32::NAN }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -55,6 +66,12 @@ pub struct SegmentResult {
     pub min: Option<f32>,
     pub max: Option<f32>,
     pub excursion_len: f32,
+    #[serde(default)]
+    pub w_min: Option<f32>,
+    #[serde(default)]
+    pub w_max: Option<f32>,
+    #[serde(default)]
+    pub w_excursion_len: f32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -64,6 +81,7 @@ pub struct GapRun {
     pub s0: f32,
     pub s1: f32,
     pub len: f32,
+    /// 飞拍：缺胶点所在的拍照点；随动为空
     pub frames: Vec<u8>,
 }
 
@@ -93,18 +111,57 @@ impl Judgement {
 
 const MAX_INVALID_LEN: f32 = 2.0;
 
+/// 一段里某个量（位置或胶宽）的统计：极值、有没有超绝对限、最长连续超差。
+struct Stat {
+    min: Option<f32>,
+    max: Option<f32>,
+    absolute: bool,
+    excursion_len: f32,
+}
+
+fn stat(runs: &[Vec<f32>], p: &JudgeParams, window: usize, sp: f32) -> Stat {
+    let mut st = Stat { min: None, max: None, absolute: false, excursion_len: 0.0 };
+    let mut max_run = 0usize;
+    for run in runs {
+        let d = median_filter(run, window);
+        let mut out = 0usize;
+        for &v in &d {
+            st.min = Some(st.min.map_or(v, |m| m.min(v)));
+            st.max = Some(st.max.map_or(v, |m| m.max(v)));
+            st.absolute |= v < p.abs_min || v > p.abs_max;
+            if v < p.lower() || v > p.upper() {
+                out += 1;
+                max_run = max_run.max(out);
+            } else {
+                out = 0;
+            }
+        }
+    }
+    st.excursion_len = max_run as f32 * sp;
+    st
+}
+
 pub fn judge(recipe: &Recipe, table: &[PointState]) -> Judgement {
     let sp = recipe.spacing;
     let n = table.len();
+    let closed = recipe.closed;
+    // 随动的起点区（开放胶路还有终点区）不判断胶与测不成
+    let zone = recipe.follow.as_ref().map_or(0.0, |f| f.start_zone_mm);
+    let length = recipe.length();
+    let exempt = |j: usize| {
+        let s = j as f32 * sp;
+        s < zone || (!closed && s > length - zone)
+    };
 
     if let Some(j) = table.iter().position(|p| *p == PointState::Pending) {
         return Judgement::error(fault::INVALID_POINTS, format!("测量点 j={j} 未填写"));
     }
-    for run in cyclic_runs(table, |p| *p == PointState::Invalid) {
+    for run in runs_where(table, closed, |j, p| *p == PointState::Invalid && !exempt(j)) {
         let len = run.len() as f32 * sp;
         if len > MAX_INVALID_LEN {
             let seg = &recipe.segments[recipe.points.seg[run[0]] as usize];
-            return Judgement::error(fault::INVALID_POINTS, format!("{} 内边连续 {len:.1} mm 未找到", seg.name));
+            let what = if recipe.mode == InspectMode::Follow { "胶条" } else { "内边" };
+            return Judgement::error(fault::INVALID_POINTS, format!("{} {what}连续 {len:.1} mm 没测到 · s={:.1}", seg.name, run[0] as f32 * sp));
         }
     }
 
@@ -113,48 +170,49 @@ pub fn judge(recipe: &Recipe, table: &[PointState]) -> Judgement {
         .iter()
         .enumerate()
         .map(|(gi, seg)| {
-            let p = &seg.params;
-            let mut min: Option<f32> = None;
-            let mut max: Option<f32> = None;
-            let mut absolute = false;
-            let mut max_run = 0usize;
-            for run in linear_runs((0..n).filter(|&j| recipe.points.seg[j] as usize == gi), table) {
-                let d = median_filter(&run, recipe.filter_window);
-                let mut out = 0usize;
-                for &v in &d {
-                    min = Some(min.map_or(v, |m| m.min(v)));
-                    max = Some(max.map_or(v, |m| m.max(v)));
-                    absolute |= v < p.abs_min || v > p.abs_max;
-                    if v < p.lower() || v > p.upper() {
-                        out += 1;
-                        max_run = max_run.max(out);
-                    } else {
-                        out = 0;
-                    }
-                }
-            }
-            let excursion_len = max_run as f32 * sp;
-            let verdict = if absolute {
+            let idx = (0..n).filter(|&j| recipe.points.seg[j] as usize == gi);
+            let (d_runs, w_runs) = linear_runs(idx, table);
+            let pos = stat(&d_runs, &seg.params, recipe.filter_window, sp);
+            let width = seg.width.as_ref().map(|p| stat(&w_runs, p, recipe.filter_window, sp));
+            let mut verdict = if pos.absolute {
                 Verdict::NgAbsolute
-            } else if excursion_len > p.max_excursion_len {
+            } else if pos.excursion_len > seg.params.max_excursion_len {
                 Verdict::NgPosition
-            } else if excursion_len > 0.0 {
+            } else if pos.excursion_len > 0.0 {
                 Verdict::OkWithExcursion
             } else {
                 Verdict::Ok
             };
-            SegmentResult { verdict, min, max, excursion_len }
+            if let (Some(w), Some(p)) = (&width, &seg.width) {
+                let wv = if w.absolute || w.excursion_len > p.max_excursion_len {
+                    Verdict::NgWidth
+                } else if w.excursion_len > 0.0 {
+                    Verdict::OkWithExcursion
+                } else {
+                    Verdict::Ok
+                };
+                verdict = verdict.max(wv);
+            }
+            SegmentResult {
+                verdict,
+                min: pos.min,
+                max: pos.max,
+                excursion_len: pos.excursion_len,
+                w_min: width.as_ref().and_then(|w| w.min),
+                w_max: width.as_ref().and_then(|w| w.max),
+                w_excursion_len: width.as_ref().map_or(0.0, |w| w.excursion_len),
+            }
         })
         .collect();
 
     let mut gaps = Vec::new();
-    for run in cyclic_runs(table, |p| *p == PointState::Gap) {
+    for run in runs_where(table, closed, |j, p| *p == PointState::Gap && !exempt(j)) {
         let len = run.len() as f32 * sp;
         if len <= recipe.max_gap_len {
             continue;
         }
         let segment = recipe.points.seg[run[0]] as usize;
-        let mut frames: Vec<u8> = run.iter().map(|&j| recipe.points.k[j]).collect();
+        let mut frames: Vec<u8> = if recipe.mode == InspectMode::FlyShot { run.iter().map(|&j| recipe.points.k[j]).collect() } else { Vec::new() };
         frames.dedup();
         segments[segment].verdict = segments[segment].verdict.max(Verdict::NgGap);
         gaps.push(GapRun { segment, s0: run[0] as f32 * sp, s1: (run[run.len() - 1] + 1) as f32 * sp, len, frames });
@@ -164,12 +222,13 @@ pub fn judge(recipe: &Recipe, table: &[PointState]) -> Judgement {
     let reason = match verdict {
         Verdict::NgGap => {
             let g = &gaps[0];
-            let frames = g.frames.iter().map(|k| format!("帧 {k}")).collect::<Vec<_>>().join(" + ");
-            let merged = if g.frames.len() > 1 { "，跨帧合并" } else { "" };
-            format!(
-                "{} 断胶 {:.1} mm > {:.1} mm · s={:.1}–{:.1} · {frames}{merged}",
-                recipe.segments[g.segment].name, g.len, recipe.max_gap_len, g.s0, g.s1
-            )
+            let frames = if g.frames.is_empty() {
+                String::new()
+            } else {
+                let f = g.frames.iter().map(|k| format!("帧 {k}")).collect::<Vec<_>>().join(" + ");
+                format!(" · {f}{}", if g.frames.len() > 1 { "，跨帧合并" } else { "" })
+            };
+            format!("{} 断胶 {:.1} mm > {:.1} mm · s={:.1}–{:.1}{frames}", recipe.segments[g.segment].name, g.len, recipe.max_gap_len, g.s0, g.s1)
         }
         Verdict::Ok => format!("{} 段全部合格 · {n} 点", segments.len()),
         _ => {
@@ -184,14 +243,23 @@ pub fn judge(recipe: &Recipe, table: &[PointState]) -> Judgement {
                     s.min.unwrap_or(0.0),
                     s.max.unwrap_or(0.0)
                 ),
-                Verdict::NgPosition => format!(
-                    "{} 连续超差 {:.1} mm > 允许 {:.1} mm",
-                    seg.name, s.excursion_len, seg.params.max_excursion_len
-                ),
-                _ => format!(
-                    "{} 局部超差 {:.1} mm ≤ 允许 {:.1} mm",
-                    seg.name, s.excursion_len, seg.params.max_excursion_len
-                ),
+                Verdict::NgPosition => format!("{} 连续超差 {:.1} mm > 允许 {:.1} mm", seg.name, s.excursion_len, seg.params.max_excursion_len),
+                Verdict::NgWidth => {
+                    let p = seg.width.as_ref().unwrap();
+                    format!(
+                        "{} 胶宽 {:.2}–{:.2} mm 超出 [{:.2}, {:.2}] · 连续 {:.1} mm",
+                        seg.name,
+                        s.w_min.unwrap_or(0.0),
+                        s.w_max.unwrap_or(0.0),
+                        p.lower(),
+                        p.upper(),
+                        s.w_excursion_len
+                    )
+                }
+                _ => {
+                    let len = s.excursion_len.max(s.w_excursion_len);
+                    format!("{} 局部超差 {len:.1} mm ≤ 允许 {:.1} mm", seg.name, seg.params.max_excursion_len)
+                }
             }
         }
     };
@@ -199,17 +267,30 @@ pub fn judge(recipe: &Recipe, table: &[PointState]) -> Judgement {
     Judgement { verdict, plc_code: verdict.plc_code(), fault_code: 0, reason, segments, gaps }
 }
 
-/// 在闭合胶路上找满足条件的连续区间，首尾相接处合并为一段。
-fn cyclic_runs(table: &[PointState], pred: impl Fn(&PointState) -> bool) -> Vec<Vec<usize>> {
+/// 满足条件的连续区间。闭合胶路首尾相接处合并为一段。
+fn runs_where(table: &[PointState], closed: bool, pred: impl Fn(usize, &PointState) -> bool) -> Vec<Vec<usize>> {
     let n = table.len();
-    let Some(start) = (0..n).find(|&j| !pred(&table[j])) else {
-        return if n > 0 { vec![(0..n).collect()] } else { Vec::new() };
-    };
     let mut runs = Vec::new();
     let mut cur = Vec::new();
+    if !closed {
+        for (j, p) in table.iter().enumerate() {
+            if pred(j, p) {
+                cur.push(j);
+            } else if !cur.is_empty() {
+                runs.push(std::mem::take(&mut cur));
+            }
+        }
+        if !cur.is_empty() {
+            runs.push(cur);
+        }
+        return runs;
+    }
+    let Some(start) = (0..n).find(|&j| !pred(j, &table[j])) else {
+        return if n > 0 { vec![(0..n).collect()] } else { Vec::new() };
+    };
     for i in 1..=n {
         let j = (start + i) % n;
-        if pred(&table[j]) {
+        if pred(j, &table[j]) {
             cur.push(j);
         } else if !cur.is_empty() {
             runs.push(std::mem::take(&mut cur));
@@ -218,21 +299,34 @@ fn cyclic_runs(table: &[PointState], pred: impl Fn(&PointState) -> bool) -> Vec<
     runs
 }
 
-/// 段内连续的已测点，缺胶或无效点处断开，供滤波与超差长度统计。
-fn linear_runs(indices: impl Iterator<Item = usize>, table: &[PointState]) -> Vec<Vec<f32>> {
-    let mut runs = Vec::new();
-    let mut cur = Vec::new();
+/// 段内连续的已测点（位置、胶宽各一份），缺胶或无效点处断开，供滤波与超差长度统计。
+fn linear_runs(indices: impl Iterator<Item = usize>, table: &[PointState]) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    let (mut d_runs, mut w_runs) = (Vec::new(), Vec::new());
+    let (mut d_cur, mut w_cur) = (Vec::new(), Vec::new());
     for j in indices {
-        if let PointState::Measured(d) = table[j] {
-            cur.push(d);
-        } else if !cur.is_empty() {
-            runs.push(std::mem::take(&mut cur));
+        if let PointState::Measured { d, w } = table[j] {
+            d_cur.push(d);
+            if w.is_finite() {
+                w_cur.push(w);
+            } else if !w_cur.is_empty() {
+                w_runs.push(std::mem::take(&mut w_cur));
+            }
+        } else {
+            if !d_cur.is_empty() {
+                d_runs.push(std::mem::take(&mut d_cur));
+            }
+            if !w_cur.is_empty() {
+                w_runs.push(std::mem::take(&mut w_cur));
+            }
         }
     }
-    if !cur.is_empty() {
-        runs.push(cur);
+    if !d_cur.is_empty() {
+        d_runs.push(d_cur);
     }
-    runs
+    if !w_cur.is_empty() {
+        w_runs.push(w_cur);
+    }
+    (d_runs, w_runs)
 }
 
 fn median_filter(values: &[f32], window: usize) -> Vec<f32> {
@@ -257,7 +351,7 @@ mod tests {
     use crate::recipe::builtin;
 
     fn base(recipe: &Recipe) -> Vec<PointState> {
-        vec![PointState::Measured(0.75); recipe.point_count()]
+        vec![PointState::measured(0.75); recipe.point_count()]
     }
 
     #[test]
@@ -288,9 +382,17 @@ mod tests {
     fn short_excursion_is_allowed_long_one_is_ng() {
         let recipe = builtin().remove(0);
         let mut table = base(&recipe);
-        (100..104).for_each(|j| table[j] = PointState::Measured(1.6));
+        (100..104).for_each(|j| table[j] = PointState::measured(1.6));
         assert_eq!(judge(&recipe, &table).verdict, Verdict::OkWithExcursion);
-        (100..110).for_each(|j| table[j] = PointState::Measured(1.6));
+        (100..110).for_each(|j| table[j] = PointState::measured(1.6));
         assert_eq!(judge(&recipe, &table).verdict, Verdict::NgPosition);
+    }
+
+    #[test]
+    fn narrow_bead_is_ng_width() {
+        let recipe = builtin().into_iter().find(|r| r.follow.is_some()).unwrap();
+        let mut table = vec![PointState::Measured { d: 0.0, w: 2.0 }; recipe.point_count()];
+        (200..220).for_each(|j| table[j] = PointState::Measured { d: 0.0, w: 1.1 });
+        assert_eq!(judge(&recipe, &table).verdict, Verdict::NgWidth);
     }
 }

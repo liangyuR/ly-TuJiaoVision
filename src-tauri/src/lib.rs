@@ -1,6 +1,9 @@
+mod caliper;
 mod camera;
 mod commands;
 mod cycle;
+mod follow;
+mod frame;
 mod history;
 mod inspection;
 mod judge;
@@ -8,10 +11,15 @@ mod measure;
 mod mvs;
 mod plc;
 mod recipe;
+mod recipe_api;
+mod recorder;
+mod replay;
 mod settings;
 mod sim;
+mod simfollow;
 mod simimage;
 mod store;
+mod teach;
 mod vision;
 
 use tauri::Manager;
@@ -29,12 +37,10 @@ pub fn run() {
             app.manage(plc::PlcHost::init(app.handle())?);
             plc::PlcHost::start_if_configured(app.handle());
             cycle::CycleHost::start(app.handle());
-            camera::CameraHost::start(app.handle());
+            camera::CameraRig::start(app.handle());
+            measure::apply_settings(app.handle());
             let handle = app.handle().clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                cycle::purge_history(&handle);
-                vision::apply_settings(&handle);
-            });
+            tauri::async_runtime::spawn_blocking(move || cycle::purge_history(&handle));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -59,15 +65,28 @@ pub fn run() {
             cycle::cycle_save_settings,
             cycle::cycle_select_recipe,
             cycle::cycle_reset,
-            camera::camera_status,
-            camera::camera_get_config,
+            camera::camera_rig_status,
+            camera::camera_rig_config,
             camera::camera_save_config,
+            camera::camera_add,
+            camera::camera_remove,
             camera::camera_list_devices,
             camera::camera_preview,
             camera::camera_soft_trigger,
             camera::camera_dry_run_start,
             camera::camera_dry_run_get,
             camera::camera_dry_run_stop,
+            recipe_api::recipe_list,
+            recipe_api::recipe_doc,
+            recipe_api::recipe_preview,
+            recipe_api::recipe_template,
+            recipe_api::recipe_save,
+            recipe_api::recipe_delete,
+            recipe_api::recipe_parse_points,
+            teach::teach_follow_probe,
+            teach::teach_flyshot_status,
+            teach::teach_flyshot_save,
+            teach::records_list,
             history::history_query,
             history::history_detail,
             history::history_recipe,
