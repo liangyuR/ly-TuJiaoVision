@@ -19,8 +19,8 @@ tokio = { version = "1", features = ["sync", "time", "macros"] }
 libloading = "0.8"
 rusqlite = { version = "0.40", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-# lyFlow feat/glue（ABI v12，图像域 + 涂胶飞拍积木）。合入 main 并推送后改成 git 依赖、固定提交号。
-lyflow-client = { path = "../../LyFlow-glue/crates/lyflow-client" }
+# lyFlow main 暂无图像注入与 glue 积木，vision::Engine::run 先直接报错；glue 合入后恢复
+lyflow-client = { git = "ssh://git@github.com/liangyuR/lyFlow.git", branch = "main" }
 ly-plc = { git = "ssh://git@github.com/liangyuR/ly-plc.git", branch = "main" }
 
 # 模拟相机逐像素合成图像，未优化时一帧要一两秒，赶不上节拍

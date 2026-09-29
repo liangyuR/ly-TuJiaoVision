@@ -6,7 +6,7 @@ use std::ffi::{c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use lyflow_client::{Core, RunHandle, RunImageInput, RunSpec};
+use lyflow_client::{Core, RunHandle, RunSpec};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
@@ -32,6 +32,9 @@ impl std::fmt::Debug for FrameImage {
     }
 }
 
+/// lyFlow main 的 C ABI 只能注入点云；glue 分支的 RunImageInput 合入后删掉这个开关，恢复逐帧注图。
+const IMAGE_INPUT_UNSUPPORTED: bool = true;
+
 unsafe extern "C" fn ignore_event(_: *const c_char, _: *mut c_void) {}
 
 pub struct Engine {
@@ -49,18 +52,12 @@ impl Engine {
     }
 
     /// 跑一次图，返回 run summary 与图级命名输出（都已解析成 JSON）。
-    pub fn run(&self, graph: &str, run_id: &str, base_dir: &str, image: &FrameImage, params: &Value) -> Result<RunResult, String> {
+    pub fn run(&self, graph: &str, run_id: &str, base_dir: &str, _image: &FrameImage, params: &Value) -> Result<RunResult, String> {
+        if IMAGE_INPUT_UNSUPPORTED {
+            return Err("当前 lyFlow（main）不支持注入图像，无法运行飞拍检测图".into());
+        }
         let params_json = params.to_string();
-        let inputs = [RunImageInput {
-            node_id: "n_load".into(),
-            port: "image".into(),
-            width: image.width,
-            height: image.height,
-            channels: 1,
-            pixels: image.pixels.clone(),
-        }];
-        let mut spec = RunSpec::new(graph, run_id, base_dir, &[]).with_params_json(&params_json);
-        spec.image_inputs = &inputs;
+        let spec = RunSpec::new(graph, run_id, base_dir, &[]).with_params_json(&params_json);
         let handle = unsafe { RunHandle::start(self.core.clone(), spec, ignore_event, Box::new(())) }.map_err(|e| e.to_string())?;
         handle.join();
         let summary: Value = self
