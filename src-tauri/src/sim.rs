@@ -148,6 +148,7 @@ async fn run_part(app: &AppHandle, recipe: &Arc<Recipe>, scenario: Scenario, vis
             TriggerMode::Fly => 450,
             TriggerMode::Stop => 1100,
         };
+        let cam = cycle.camera.index_of(&recipe.camera).ok_or_else(|| format!("配方用的相机 {} 不在相机组里", recipe.camera))?;
         let lost = scenario.lost_frame(n);
         let locate_fail = scenario.locate_fail_frame(n);
         // 机器人每件的定位偏差：±0.4 mm、±0.15°（模板定位要吸收它）
@@ -163,7 +164,7 @@ async fn run_part(app: &AppHandle, recipe: &Arc<Recipe>, scenario: Scenario, vis
                 pose: if locate_fail == Some(k) { PoseError { dx: pose.dx + 15.0, dy: pose.dy + 15.0, ..pose } } else { pose },
                 seed: sn as u64 * 16 + k as u64,
             });
-            let _ = cycle.camera.trigger(recipe.camera, lost == Some(k), render);
+            let _ = cycle.camera.trigger(cam, lost == Some(k), render);
         }
         sleep(Duration::from_millis(300)).await;
         put(app, tag::PART_END, json!(true)).await?;
@@ -228,8 +229,12 @@ async fn run_follow_part(app: &AppHandle, recipe: &Arc<Recipe>, scenario: Scenar
             let dt = ((ts - armed) as f32 - delay) / 1000.0;
             if dt <= 0.0 { 0.0 } else { t[((dt / DT) as usize).min(t.len() - 1)] }
         };
-        let cams: Vec<(u8, crate::follow::FollowCalib)> =
-            recipe.cameras().into_iter().filter_map(|c| cycle.camera.slot(c as usize).and_then(|s| s.config().follow).map(|f| (c, f))).collect();
+        let cams: Vec<(u8, crate::follow::FollowCalib)> = cycle
+            .camera
+            .resolve(&recipe.cameras())?
+            .into_iter()
+            .filter_map(|c| cycle.camera.slot(c as usize).and_then(|s| s.config().follow).map(|f| (c, f)))
+            .collect();
         let (r, lost, s_src) = (recipe.clone(), scenario == Scenario::LostFrame, s_at.clone());
         let source: SimSource = Arc::new(move |cam, ts| {
             let calib = &cams.iter().find(|(c, _)| *c == cam)?.1;
@@ -255,7 +260,8 @@ async fn run_follow_part(app: &AppHandle, recipe: &Arc<Recipe>, scenario: Scenar
             if cycle.sim.stop.load(Ordering::SeqCst) && !on(app, tag::ARMED) {
                 break;
             }
-            sleep(Duration::from_millis(40)).await;
+            // 真实 PLC 每个扫描周期（约 10 ms）都刷新进度寄存器；写慢了读到的值会比实际旧几十毫秒、还忽新忽旧
+            sleep(Duration::from_millis(if plc_scale.is_some() { 10 } else { 40 })).await;
         }
         put(app, tag::PART_END, json!(true)).await?;
     }
@@ -333,8 +339,8 @@ pub fn sim_start(
         return Err("PLC 模拟器未连接".into());
     }
     let recipe = cycle.recipe(&recipe_id).ok_or("配方不存在")?;
-    for c in recipe.cameras() {
-        let slot = cycle.camera.slot(c as usize).ok_or_else(|| format!("配方用的相机 {} 不在相机组里", c + 1))?;
+    for c in cycle.camera.resolve(&recipe.cameras())? {
+        let slot = cycle.camera.slot(c as usize).ok_or("相机不存在")?;
         let cam = slot.config();
         match recipe.mode {
             InspectMode::FlyShot => {

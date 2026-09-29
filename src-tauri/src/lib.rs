@@ -82,7 +82,7 @@ pub fn run() {
             recipe_api::recipe_template,
             recipe_api::recipe_save,
             recipe_api::recipe_delete,
-            recipe_api::recipe_parse_points,
+            recipe_api::recipe_parse_path,
             teach::teach_follow_probe,
             teach::teach_flyshot_status,
             teach::teach_flyshot_save,

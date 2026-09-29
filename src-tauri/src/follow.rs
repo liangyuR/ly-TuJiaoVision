@@ -133,7 +133,8 @@ pub struct Tracker {
 /// 以"值第一次读到时的轮询时刻"为基准，用相隔至少 30 ms 的两次变化估出速度，外推到帧的时刻。
 #[derive(Default)]
 struct Progress {
-    /// 布防时寄存器里的值：PLC 没清零时（还是上一件的终值）以它为零点；之后读到更小的值说明 PLC 清零了，零点回到 0
+    /// 零点：布防那一刻寄存器里的值（PLC 没清零时是上一件的终值）；读不到时用第一次读到的值。
+    /// 之后读到比零点还小的值说明 PLC 清零了，零点回到 0
     zero: Option<f32>,
     /// 最近一次变化后的值与它第一次被读到的轮询时刻
     last: Option<(f32, i64)>,
@@ -152,8 +153,12 @@ impl Progress {
         }
         let value = value - self.zero.unwrap();
         if self.last.is_none_or(|(v, _)| (value - v).abs() > 1e-3) {
+            // 上一个值保持了很久：机器人刚从静止起步（起步延时、中途停顿），这一跳除以整段静止时间会把速度算得很小，
+            // 起点同步又恰好在这时做，会把这个暂时的滞后当成固定偏差记下来。静止后的第一跳只当新起点，不估速度
+            let was_still = self.last.is_some_and(|(_, t)| poll_ts - t > STILL_MS);
             self.last = Some((value, poll_ts));
             match self.base {
+                _ if was_still => self.base = Some((value, poll_ts)),
                 Some((bv, bt)) if poll_ts - bt >= 30 => {
                     let inst = ((value - bv) / ((poll_ts - bt) as f32 / 1000.0)).clamp(0.0, 2000.0);
                     self.speed = if self.speed == 0.0 { inst } else { 0.7 * self.speed + 0.3 * inst };
@@ -164,28 +169,51 @@ impl Progress {
             }
         }
         let (v, t) = self.last.unwrap();
-        // 外推最多 0.3 s（几个轮询周期），PLC 真停了就停在那之后的位置上
-        v + self.speed * ((frame_ts - t).clamp(0, 300) as f32 / 1000.0)
+        // 外推最多 150 ms（两三个轮询周期）：PLC 的值不再变就是机器人停了，不能一直往前推
+        v + self.speed * ((frame_ts - t).clamp(0, 150) as f32 / 1000.0)
     }
 }
 
-/// 某帧要测的点；start_probe 为真时这一帧还要找胶条起点，做起点同步。
+/// 进度值保持超过这么久算机器人静止过。
+const STILL_MS: i64 = 250;
+
+/// 某帧要测的点；start_probe 为真时这一帧还要找胶条起点，做起点同步。calib 是本件开工时这台相机的标定。
 pub struct Plan {
     pub points: Vec<u32>,
     pub start_probe: bool,
+    pub calib: FollowCalib,
 }
 
 /// 单帧横向同步的修正量只采纳这么多，压住单帧噪声。
 const LATERAL_GAIN: f32 = 0.7;
 
 impl Tracker {
-    pub fn new(recipe: Arc<Recipe>, cams: Vec<(u8, FollowCalib)>, armed_ts: i64) -> Result<Self, String> {
+    /// plc_zero：布防时 PLC 进度寄存器的原始值（按进度定位时作零点）。
+    pub fn new(recipe: Arc<Recipe>, cams: Vec<(u8, FollowCalib)>, armed_ts: i64, plc_zero: Option<f32>) -> Result<Self, String> {
         let spec = recipe.follow.clone().ok_or("配方没有随动参数")?;
         if cams.is_empty() {
             return Err("随动相机都没有标定".into());
         }
+        let zero = match spec.timing {
+            FollowTiming::Plc { scale } => plc_zero.map(|v| v * scale),
+            FollowTiming::Timed { .. } => None,
+        };
         let n = recipe.point_count();
-        Ok(Self { recipe, spec, cams, covered: vec![false; n], armed_ts, offset: 0.0, start_synced: false, start_probe_pending: false, generation: 0, start_delta: 0.0, plc: Progress::default(), last_s: vec![None; 8], advance: 0.0 })
+        Ok(Self {
+            recipe,
+            spec,
+            cams,
+            covered: vec![false; n],
+            armed_ts,
+            offset: 0.0,
+            start_synced: false,
+            start_probe_pending: false,
+            generation: 0,
+            start_delta: 0.0,
+            plc: Progress { zero, ..Progress::default() },
+            last_s: vec![None; 8],
+            advance: 0.0,
+        })
     }
 
     /// 胶嘴位置：按时间推算（或用 PLC 给的进度），再加上从图像里同步出来的修正。
@@ -204,20 +232,26 @@ impl Tracker {
         s - self.spec.near_mm - 2.0 > 0.0 && s < self.spec.far_mm + self.spec.step_mm + 6.0
     }
 
-    /// 起点同步的结果：δ = 推算位置 − 实际位置。返回同步前按错的位置测过、需要重测的候选点（已分出去且在胶嘴身后的）；
-    /// 调用方挑出真正测坏的（起点附近、测成缺胶的）用 release 放回去。
-    pub fn apply_start(&mut self, delta: Option<f32>, s: f32) -> Vec<u32> {
+    /// 找起点的那一帧测完了（不管找没找到）。没找到时还在可找的范围里就等下一帧再找，出了范围由 start_given_up 收尾。
+    pub fn probe_done(&mut self) {
         self.start_probe_pending = false;
-        let Some(d) = delta else {
-            // 找不到起点：还在可找的范围里就等下一帧再找，出了范围由 start_given_up 收尾
-            return Vec::new();
-        };
+    }
+
+    /// 起点同步：δ = 推算位置 − 实际位置。之后发出的帧算新一代。
+    pub fn apply_start(&mut self, delta: f32) {
         self.start_synced = true;
-        self.offset -= d;
-        self.start_delta = d;
+        self.offset -= delta;
+        self.start_delta = delta;
         self.generation += 1;
-        let sp = self.recipe.spacing;
-        (0..self.covered.len()).filter(|&j| self.covered[j] && (j as f32 * sp) < s).map(|j| j as u32).collect()
+    }
+
+    /// 这些点已经测过（起点同步那一帧按新位置顺带重测的），后面的帧不用再分。
+    pub fn cover(&mut self, points: &[u32]) {
+        for &j in points {
+            if let Some(c) = self.covered.get_mut(j as usize) {
+                *c = true;
+            }
+        }
     }
 
     /// 拐角处的横向同步：δ = 推算位置 − 实际位置。
@@ -234,13 +268,14 @@ impl Tracker {
         false
     }
 
-    /// 胶嘴位于 s 时由哪台相机测：能看到的点最多的那台。
-    fn best_cam(&self, s: f32) -> Option<(u8, Vec<usize>)> {
+    /// 胶嘴位于 s 时由哪台相机测：能看到的点最多的那台（返回它在 cams 里的位置与能看到的点）。
+    fn best_cam(&self, s: f32) -> Option<(usize, Vec<usize>)> {
         self.cams
             .iter()
-            .map(|(c, calib)| (*c, visible(&self.recipe, &self.spec, calib, s)))
+            .enumerate()
+            .map(|(i, (_, calib))| (i, visible(&self.recipe, &self.spec, calib, s)))
             .filter(|(_, v)| !v.is_empty())
-            .max_by(|a, b| a.1.len().cmp(&b.1.len()).then(b.0.cmp(&a.0)))
+            .max_by(|a, b| a.1.len().cmp(&b.1.len()).then(self.cams[b.0].0.cmp(&self.cams[a.0].0)))
     }
 
     /// 相机 cam 在胶嘴位于 s 时拍到的一帧：要不要测、测哪些点。分出去的点记为已覆盖。
@@ -258,7 +293,7 @@ impl Tracker {
             return None;
         }
         let (best, visible) = self.best_cam(s)?;
-        if best != cam {
+        if self.cams[best].0 != cam {
             return None;
         }
         let fresh: Vec<usize> = visible.into_iter().filter(|&j| !self.covered[j]).collect();
@@ -275,7 +310,7 @@ impl Tracker {
             self.covered[j] = true;
         }
         self.start_probe_pending |= start_probe;
-        Some(Plan { points: fresh.into_iter().map(|j| j as u32).collect(), start_probe })
+        Some(Plan { points: fresh.into_iter().map(|j| j as u32).collect(), start_probe, calib: self.cams[best].1.clone() })
     }
 
 
@@ -319,7 +354,7 @@ mod tests {
     #[test]
     fn three_cameras_cover_whole_closed_path() {
         let recipe = builtin().into_iter().find(|r| r.follow.is_some()).unwrap();
-        let mut t = Tracker::new(recipe.clone(), tri_calib(), 0).unwrap();
+        let mut t = Tracker::new(recipe.clone(), tri_calib(), 0, None).unwrap();
         let mut s = 0.0;
         while s < t.end_s() {
             for c in 0..3 {

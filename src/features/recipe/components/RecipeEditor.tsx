@@ -7,7 +7,8 @@ import type { FollowSpec, JudgeParams, PathSpec, Recipe, RecipeDoc, SegmentLimit
 interface Props {
   initial: RecipeDoc;
   originalId: string | null;
-  cameraCount: number;
+  /** 相机组里的相机：配方按编号引用 */
+  cameras: { id: string; name: string }[];
   onSaved: (id: string) => void;
 }
 
@@ -22,12 +23,25 @@ const paramFields: [keyof JudgeParams, string][] = [
 
 const pointsText = (pts: [number, number][]) => pts.map(([x, y]) => `${x}, ${y}`).join("\n");
 
-function parseText(text: string): [number, number][] {
+function parseRows(text: string): number[][] {
   return text
     .split(/\r?\n/)
     .map((l) => l.split(/[,;\s\t]+/).filter(Boolean).map(Number))
-    .filter((v) => v.length >= 2 && v.every(Number.isFinite))
-    .map((v) => [v[0], v[1]] as [number, number]);
+    .filter((v) => v.length >= 2 && v.every(Number.isFinite));
+}
+
+function parseText(text: string): [number, number][] {
+  return parseRows(text).map((v) => [v[0], v[1]] as [number, number]);
+}
+
+/** 胶路文本：每行 x, y，第 3 列可选，是从这一点出发那条边的 bulge（圆弧）。 */
+const pathText = (pts: [number, number][], bulges: number[] = []) =>
+  pts.map(([x, y], i) => (bulges[i] ? `${x}, ${y}, ${Number(bulges[i].toFixed(6))}` : `${x}, ${y}`)).join("\n");
+
+function parsePathText(text: string): { points: [number, number][]; bulges: number[] } {
+  const rows = parseRows(text);
+  const bulges = rows.map((v) => v[2] ?? 0);
+  return { points: rows.map((v) => [v[0], v[1]] as [number, number]), bulges: bulges.some((b) => b !== 0) ? bulges : [] };
 }
 
 function Num({ label, value, onChange, step = 0.1, hint }: { label: string; value: number; onChange: (v: number) => void; step?: number; hint?: string }) {
@@ -82,12 +96,12 @@ function LimitsTable({ label, value, onChange, widthDefault }: { label: string; 
   );
 }
 
-export default function RecipeEditor({ initial, originalId, cameraCount, onSaved }: Props) {
+export default function RecipeEditor({ initial, originalId, cameras, onSaved }: Props) {
   const [doc, setDoc] = useState<RecipeDoc>(initial);
   const [preview, setPreview] = useState<Recipe | null>(null);
   const [previewError, setPreviewError] = useState("");
   const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null);
-  const [polyText, setPolyText] = useState(initial.path.kind === "polyline" ? pointsText(initial.path.points) : "");
+  const [polyText, setPolyText] = useState(initial.path.kind === "polyline" ? pathText(initial.path.points, initial.path.bulges) : "");
   const [shotsText, setShotsText] = useState(pointsText(initial.shots));
 
   useEffect(() => {
@@ -113,10 +127,14 @@ export default function RecipeEditor({ initial, originalId, cameraCount, onSaved
 
   const importFile = async (file: File) => {
     try {
-      const pts = await recipeApi.parsePoints(await file.text(), file.name);
-      setPolyText(pointsText(pts));
-      setPath({ kind: "polyline", points: pts, closed: doc.path.kind === "polyline" ? doc.path.closed : true, radius: doc.path.kind === "polyline" ? doc.path.radius : 0 });
-      setNotice({ ok: true, text: `从 ${file.name} 读到 ${pts.length} 个点` });
+      const r = await recipeApi.parsePath(await file.text(), file.name);
+      setPolyText(pathText(r.points, r.bulges));
+      setPath({ kind: "polyline", points: r.points, bulges: r.bulges, closed: r.closed, radius: doc.path.kind === "polyline" ? doc.path.radius : 0 });
+      const arcs = r.bulges.filter((b) => b !== 0).length;
+      setNotice({
+        ok: true,
+        text: `从 ${file.name} 读到 ${r.points.length} 个点${arcs ? `、${arcs} 段圆弧` : ""}${r.closed ? "，闭合" : ""}${r.note ? `。${r.note}` : ""}`,
+      });
     } catch (e) {
       setNotice({ ok: false, text: String(e) });
     }
@@ -180,8 +198,8 @@ export default function RecipeEditor({ initial, originalId, cameraCount, onSaved
               <button
                 className={doc.path.kind === "polyline" ? "active" : ""}
                 onClick={() => {
-                  const pts = parseText(polyText);
-                  setPath({ kind: "polyline", points: pts.length >= 2 ? pts : [[0, 0], [100, 0]], closed: false, radius: 0 });
+                  const p = parsePathText(polyText);
+                  setPath({ kind: "polyline", points: p.points.length >= 2 ? p.points : [[0, 0], [100, 0]], bulges: p.points.length >= 2 ? p.bulges : [], closed: false, radius: 0 });
                 }}
               >
                 折线 / 导入
@@ -201,10 +219,10 @@ export default function RecipeEditor({ initial, originalId, cameraCount, onSaved
                 className="input mono"
                 rows={7}
                 value={polyText}
-                placeholder={"每行一个点：x, y（mm）"}
+                placeholder={"每行一个点：x, y（mm），可选第 3 列 bulge"}
                 onChange={(e) => {
                   setPolyText(e.target.value);
-                  if (doc.path.kind === "polyline") setPath({ ...doc.path, points: parseText(e.target.value) });
+                  if (doc.path.kind === "polyline") setPath({ ...doc.path, ...parsePathText(e.target.value) });
                 }}
               />
               <div className="rcp-poly-side">
@@ -218,7 +236,9 @@ export default function RecipeEditor({ initial, originalId, cameraCount, onSaved
                   闭合胶路
                 </label>
                 <Num label="拐角倒圆半径（mm）" value={doc.path.radius} onChange={(v) => doc.path.kind === "polyline" && setPath({ ...doc.path, radius: v })} />
-                <p className="muted hint">DXF 读 LWPOLYLINE / POLYLINE 顶点与 LINE 端点，按文件里的先后顺序连接。</p>
+                <p className="muted hint">
+                  DXF 读 ENTITIES 段里的 LWPOLYLINE / POLYLINE（含圆弧与闭合）、CIRCLE，以及首尾相连的 LINE / ARC；有多条路径时取最长的。第 3 列 bulge = tan(圆心角/4)，正值逆时针；首尾重合的点自动当作闭合。
+                </p>
               </div>
             </div>
           )}
@@ -258,10 +278,11 @@ export default function RecipeEditor({ initial, originalId, cameraCount, onSaved
               </label>
               <label className="field">
                 <span>相机</span>
-                <select className="input" value={doc.camera} onChange={(e) => set("camera", Number(e.target.value))}>
-                  {Array.from({ length: Math.max(cameraCount, doc.camera + 1) }, (_, i) => (
-                    <option key={i} value={i}>
-                      相机 {i + 1}
+                <select className="input" value={doc.camera} onChange={(e) => set("camera", e.target.value)}>
+                  {!cameras.some((c) => c.id === doc.camera) && <option value={doc.camera}>{doc.camera}（不在相机组里）</option>}
+                  {cameras.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name} · {c.id}
                     </option>
                   ))}
                 </select>
@@ -288,14 +309,21 @@ export default function RecipeEditor({ initial, originalId, cameraCount, onSaved
           <Section title="随动参数">
             <div className="rcp-cams">
               <span>参与相机</span>
-              {Array.from({ length: Math.max(cameraCount, ...f.cameras.map((c) => c + 1)) }, (_, i) => (
-                <label key={i} className="check">
+              {[...cameras, ...f.cameras.filter((id) => !cameras.some((c) => c.id === id)).map((id) => ({ id, name: `${id}（不在相机组里）` }))].map((c) => (
+                <label key={c.id} className="check">
                   <input
                     type="checkbox"
-                    checked={f.cameras.includes(i)}
-                    onChange={(e) => setFollow({ cameras: e.target.checked ? [...f.cameras, i].sort() : f.cameras.filter((c) => c !== i) })}
+                    checked={f.cameras.includes(c.id)}
+                    onChange={(e) =>
+                      setFollow({
+                        // 按相机组里的顺序排，与图像源页一致
+                        cameras: e.target.checked
+                          ? cameras.map((x) => x.id).filter((id) => id === c.id || f.cameras.includes(id))
+                          : f.cameras.filter((id) => id !== c.id),
+                      })
+                    }
                   />
-                  相机 {i + 1}
+                  {c.name}
                 </label>
               ))}
             </div>

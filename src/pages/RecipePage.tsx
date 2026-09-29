@@ -9,7 +9,7 @@ export default function RecipePage() {
   const [errors, setErrors] = useState<string[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [editing, setEditing] = useState<{ doc: RecipeDoc; originalId: string | null; key: number } | null>(null);
-  const [cameraCount, setCameraCount] = useState(1);
+  const [cameras, setCameras] = useState<{ id: string; name: string }[]>([]);
   const [error, setError] = useState("");
 
   const reload = async (select?: string) => {
@@ -33,7 +33,7 @@ export default function RecipePage() {
 
   useEffect(() => {
     reload();
-    cameraApi.rigConfig().then((c) => setCameraCount(c.length));
+    cameraApi.rigConfig().then((c) => setCameras(c.map(({ id, name }) => ({ id, name }))));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -112,7 +112,7 @@ export default function RecipePage() {
       <div className="rcp-main">
         {editing && (
           <div className="panel">
-            <RecipeEditor key={editing.key} initial={editing.doc} originalId={editing.originalId} cameraCount={cameraCount} onSaved={(id) => reload(id)} />
+            <RecipeEditor key={editing.key} initial={editing.doc} originalId={editing.originalId} cameras={cameras} onSaved={(id) => reload(id)} />
           </div>
         )}
         {saved && saved.mode === "flyShot" && <FlyshotTeach recipe={saved} />}

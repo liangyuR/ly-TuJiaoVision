@@ -9,6 +9,7 @@ function call<T>(cmd: string, args: Record<string, unknown> | undefined, fallbac
 }
 
 export const defaultCameraConfig: CameraConfig = {
+  id: "",
   name: "相机",
   source: "sim",
   serial: "",

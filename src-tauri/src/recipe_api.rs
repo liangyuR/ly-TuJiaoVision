@@ -6,7 +6,7 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::cycle::{CycleHost, Input, Phase, RecipeSummary};
-use crate::recipe::{self, default_follow_spec, InspectMode, Recipe, RecipeDoc};
+use crate::recipe::{self, default_follow_spec, ImportedPath, InspectMode, Recipe, RecipeDoc};
 use crate::settings::CycleSettings;
 
 #[derive(Serialize)]
@@ -44,7 +44,9 @@ pub fn recipe_template(cycle: State<'_, CycleHost>, mode: InspectMode) -> Recipe
     doc.name = "新配方".into();
     doc.version = 1;
     if mode == InspectMode::Follow {
-        doc.follow = Some(default_follow_spec((0..cycle.camera.len().min(3) as u8).collect(), 80.0));
+        doc.follow = Some(default_follow_spec(cycle.camera.configs().into_iter().take(3).map(|c| c.id).collect(), 80.0));
+    } else if let Some(c) = cycle.camera.configs().into_iter().next() {
+        doc.camera = c.id;
     }
     doc
 }
@@ -79,9 +81,9 @@ pub fn recipe_delete(cycle: State<'_, CycleHost>, id: String) -> Result<(), Stri
     Ok(())
 }
 
-/// 解析胶路点文件的内容（前端读文件后把文本传过来）。
+/// 解析胶路文件的内容（前端读文件后把文本传过来）。
 #[tauri::command]
-pub fn recipe_parse_points(text: String, file_name: String) -> Result<Vec<[f32; 2]>, String> {
+pub fn recipe_parse_path(text: String, file_name: String) -> Result<ImportedPath, String> {
     let ext = std::path::Path::new(&file_name).extension().and_then(|e| e.to_str()).unwrap_or("csv");
-    recipe::parse_points(&text, ext)
+    recipe::parse_path(&text, ext)
 }

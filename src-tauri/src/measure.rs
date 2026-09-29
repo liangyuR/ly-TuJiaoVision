@@ -11,7 +11,7 @@ use tokio::sync::Semaphore;
 
 use crate::caliper;
 use crate::cycle::{CycleHost, Input};
-use crate::follow::FollowCalib;
+use crate::follow::{self, FollowCalib};
 use crate::frame::FrameImage;
 use crate::judge::PointState;
 use crate::recipe::{InspectMode, Recipe, SegmentKind};
@@ -137,7 +137,14 @@ impl Measurer for NativeMeasurer {
         let mut m = Measured::empty(job);
         caliper::measure_follow(&job.recipe, spec, calib, *s, points, image, &mut m);
         if *start_probe && spec.auto_sync {
-            m.start_sync = caliper::find_start(&job.recipe, spec, calib, *s, image);
+            if let Some(d) = caliper::find_start(&job.recipe, spec, calib, *s, image) {
+                // 找到了胶条起点：按修正后的胶嘴位置把这一帧重测一遍，连同此刻看得到的起点附近的点，
+                // 同步前按超前位置测错的那一段就从这张图里补回来
+                let s2 = *s - d;
+                let pts: Vec<u32> = follow::visible(&job.recipe, spec, calib, s2).into_iter().map(|j| j as u32).collect();
+                m = Measured { s: Some(s2), start_sync: Some(d), ..Measured::empty(job) };
+                caliper::measure_follow(&job.recipe, spec, calib, s2, &pts, image, &mut m);
+            }
         }
         Ok(m)
     }

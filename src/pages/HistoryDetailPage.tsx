@@ -58,7 +58,7 @@ export default function HistoryDetailPage() {
           },
         ]
       : [];
-    const missing = () => ({ status: "missing" as const, cam: layout.camera, s: null, arrivedMs: null, frameCounter: null, triggerCounter: null, counterJump: false, score: null, points: 0, gapPoints: 0, ms: null });
+    const missing = () => ({ status: "missing" as const, cam: 0, s: null, arrivedMs: null, frameCounter: null, triggerCounter: null, counterJump: false, score: null, points: 0, gapPoints: 0, ms: null });
     const part: PartView = {
       sn: detail.summary.sn,
       recipeId: layout.id,
@@ -103,7 +103,9 @@ export default function HistoryDetailPage() {
           {s.recipeVersion != null && ` v${s.recipeVersion}`}
           {s.recipeHash && ` #${s.recipeHash.slice(0, 6)}`}
           {s.triggerMode && ` · ${s.triggerMode === "stop" ? "停稳拍" : s.triggerMode === "follow" ? "随动" : "飞拍"}`}
-          {s.framesExpected > 0 && ` · 帧 ${s.framesReceived}/${s.framesExpected}`}
+          {s.triggerMode === "follow"
+            ? ` · 收到 ${s.framesReceived} 帧 · 测 ${detail.frames.length} 帧`
+            : s.framesExpected > 0 && ` · 帧 ${s.framesReceived}/${s.framesExpected}`}
         </span>
         <span className="spacer" />
         <span className={`vt big ${verdictClass(s.verdict)}`}>{verdictLabel[s.verdict]} · {s.plcCode}{s.faultCode ? ` / ${s.faultCode}` : ""}</span>

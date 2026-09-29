@@ -214,7 +214,8 @@ pub async fn history_export(app: AppHandle, query: HistoryQuery) -> Result<Strin
                     p.fault_code,
                     esc(&p.reason),
                     p.frames_received,
-                    p.frames_expected,
+                    // 随动没有计划帧数
+                    if p.trigger_mode.as_deref() == Some("follow") { String::new() } else { p.frames_expected.to_string() },
                     p.drain_ms.map(|v| v.to_string()).unwrap_or_default(),
                     p.retest_of.map(|v| v.to_string()).unwrap_or_default(),
                 )

@@ -30,12 +30,14 @@ export interface Segment {
 
 export type PathSpec =
   | { kind: "roundedRect"; width: number; height: number; radius: number }
-  | { kind: "polyline"; points: [number, number][]; closed: boolean; radius: number };
+  /** bulges[i] 不为 0 时第 i 条边是圆弧：tan(圆心角/4)，正值逆时针 */
+  | { kind: "polyline"; points: [number, number][]; closed: boolean; radius: number; bulges?: number[] };
 
 export type FollowTiming = { kind: "timed"; speedMmS: number; delayMs: number } | { kind: "plc"; scale: number };
 
 export interface FollowSpec {
-  cameras: number[];
+  /** 相机编号 */
+  cameras: string[];
   timing: FollowTiming;
   nearMm: number;
   farMm: number;
@@ -64,7 +66,7 @@ export interface Recipe {
   closed: boolean;
   fov: [number, number];
   shots: [number, number][];
-  camera: number;
+  camera: string;
   spacing: number;
   filterWindow: number;
   maxGapLen: number;
@@ -86,7 +88,7 @@ export interface RecipeDoc {
   productCode: number;
   mode: InspectMode;
   triggerMode: TriggerMode;
-  camera: number;
+  camera: string;
   path: PathSpec;
   spacing: number;
   filterWindow: number;
@@ -108,7 +110,7 @@ export interface RecipeSummary {
   mode: InspectMode;
   shotCount: number;
   triggerMode: TriggerMode;
-  cameras: number[];
+  cameras: string[];
   length: number;
 }
 
@@ -243,6 +245,14 @@ export interface SimStatus {
   continuous: boolean;
   parts: number;
   message: string;
+}
+
+/** 从 CSV / DXF 导入的胶路 */
+export interface ImportedPath {
+  points: [number, number][];
+  bulges: number[];
+  closed: boolean;
+  note: string | null;
 }
 
 /** 测量点显示状态 */

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -90,8 +90,53 @@ pub struct PathPoints {
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum PathSpec {
     RoundedRect { width: f32, height: f32, radius: f32 },
-    /// 折线，拐角按 radius 倒圆（0 为尖角）
-    Polyline { points: Vec<[f32; 2]>, closed: bool, radius: f32 },
+    /// 折线，两条直边之间的拐角按 radius 倒圆（0 为尖角）。
+    /// bulges[i] 不为 0 时第 i 条边（点 i → 点 i+1）是圆弧，取 DXF 的约定：tan(圆心角/4)，正值逆时针。
+    Polyline {
+        points: Vec<[f32; 2]>,
+        closed: bool,
+        radius: f32,
+        #[serde(default)]
+        bulges: Vec<f32>,
+    },
+}
+
+/// 旧文件里相机写的是相机组序号 k，读进来当作编号 "cam{k+1}"（相机组迁移时就是按位置这样编的号）。
+pub fn legacy_camera_id(k: u8) -> String {
+    format!("cam{}", k as u32 + 1)
+}
+
+fn default_camera() -> String {
+    legacy_camera_id(0)
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CameraRef {
+    Index(u8),
+    Id(String),
+}
+
+impl CameraRef {
+    fn id(self) -> String {
+        match self {
+            CameraRef::Index(k) => legacy_camera_id(k),
+            CameraRef::Id(s) => s,
+        }
+    }
+}
+
+fn camera_ref<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(CameraRef::deserialize(d)?.id())
+}
+
+fn camera_refs<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    Ok(Vec::<CameraRef>::deserialize(d)?.into_iter().map(CameraRef::id).collect())
+}
+
+/// 相机编号：字母、数字、- 和 _，最长 32 个字符。
+pub fn valid_camera_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 32 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,8 +161,9 @@ pub enum FollowTiming {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FollowSpec {
-    /// 参与检测的相机（相机组序号）
-    pub cameras: Vec<u8>,
+    /// 参与检测的相机（相机编号）
+    #[serde(deserialize_with = "camera_refs")]
+    pub cameras: Vec<String>,
     pub timing: FollowTiming,
     /// 胶嘴后方可测窗口：离胶嘴 near..far mm 的胶条
     pub near_mm: f32,
@@ -148,6 +194,9 @@ impl FollowSpec {
     fn validate(&self) -> Result<(), String> {
         if self.cameras.is_empty() {
             return Err("随动配方至少要有 1 台相机".into());
+        }
+        if !self.cameras.iter().all(|c| valid_camera_id(c)) {
+            return Err("随动相机编号只能用字母、数字、- 和 _".into());
         }
         if !(self.near_mm >= 0.0 && self.far_mm > self.near_mm + 1.0) {
             return Err("可测窗口需满足 0 ≤ 近端 < 远端 − 1 mm".into());
@@ -189,9 +238,9 @@ pub struct Recipe {
     pub closed: bool,
     pub fov: [f32; 2],
     pub shots: Vec<[f32; 2]>,
-    /// 飞拍用的相机（相机组序号）
-    #[serde(default)]
-    pub camera: u8,
+    /// 飞拍用的相机（相机编号）
+    #[serde(default = "default_camera", deserialize_with = "camera_ref")]
+    pub camera: String,
     pub spacing: f32,
     pub filter_window: usize,
     pub max_gap_len: f32,
@@ -226,11 +275,11 @@ impl Recipe {
         fnv_hex(&serde_json::to_vec(&key).unwrap_or_default())
     }
 
-    /// 本配方要用到的相机。
-    pub fn cameras(&self) -> Vec<u8> {
+    /// 本配方要用到的相机（编号）。
+    pub fn cameras(&self) -> Vec<String> {
         match (&self.mode, &self.follow) {
             (InspectMode::Follow, Some(f)) => f.cameras.clone(),
-            _ => vec![self.camera],
+            _ => vec![self.camera.clone()],
         }
     }
 
@@ -294,8 +343,8 @@ pub struct RecipeDoc {
     #[serde(default)]
     pub mode: InspectMode,
     pub trigger_mode: TriggerMode,
-    #[serde(default)]
-    pub camera: u8,
+    #[serde(default = "default_camera", deserialize_with = "camera_ref")]
+    pub camera: String,
     pub path: PathSpec,
     pub spacing: f32,
     pub filter_window: usize,
@@ -350,13 +399,26 @@ fn unit(v: [f32; 2]) -> [f32; 2] {
     [v[0] / l, v[1] / l]
 }
 
-/// 折线按半径倒圆，得到依次首尾相接的直线段与圆弧。
-fn fillet(points: &[[f32; 2]], closed: bool, radius: f32, names: Option<&[&str]>) -> Result<Vec<(String, SegmentKind, Piece)>, String> {
+/// 两点之间的圆弧边。bulge = tan(圆心角/4)，正值时从 a 到 b 逆时针（角度增大的方向）。
+fn bulge_arc(a: [f32; 2], b: [f32; 2], bulge: f32) -> Piece {
+    let chord = sub(b, a);
+    let l = (chord[0] * chord[0] + chord[1] * chord[1]).sqrt();
+    let theta = 4.0 * bulge.atan();
+    let r = l / (2.0 * (theta / 2.0).sin().abs());
+    // 圆心在弦中点沿弦的左法向偏 d（带符号：逆时针圆弧圆心在左）
+    let d = l / (2.0 * (theta / 2.0).tan());
+    let c = [(a[0] + b[0]) / 2.0 - chord[1] / l * d, (a[1] + b[1]) / 2.0 + chord[0] / l * d];
+    Piece::Arc { c, r, a0: (a[1] - c[1]).atan2(a[0] - c[0]), sweep: theta }
+}
+
+/// 折线按半径倒圆（带 bulge 的边画成圆弧），得到依次首尾相接的直线段与圆弧。
+fn fillet(points: &[[f32; 2]], closed: bool, radius: f32, bulges: &[f32], names: Option<&[&str]>) -> Result<Vec<(String, SegmentKind, Piece)>, String> {
     let n = points.len();
     if n < 2 || (closed && n < 3) {
         return Err("胶路至少要有 2 个点（闭合至少 3 个）".into());
     }
     let edges = if closed { n } else { n - 1 };
+    let bulge = |e: usize| bulges.get(e).copied().filter(|b| b.abs() > 1e-6);
     let dir: Vec<[f32; 2]> = (0..edges).map(|i| unit(sub(points[(i + 1) % n], points[i]))).collect();
     let elen: Vec<f32> = (0..edges).map(|i| Piece::Line { a: points[i], b: points[(i + 1) % n] }.len()).collect();
     if elen.iter().any(|&l| l < 1e-3) {
@@ -366,7 +428,8 @@ fn fillet(points: &[[f32; 2]], closed: bool, radius: f32, names: Option<&[&str]>
     let corner = |i: usize| -> ([f32; 2], [f32; 2], Option<Piece>) {
         let v = points[i];
         let interior = closed || (i > 0 && i < n - 1);
-        if !interior || radius <= 0.0 {
+        // 圆弧边两端不倒角：CAD 里圆弧与直边本来就相切
+        if !interior || radius <= 0.0 || bulge((i + edges - 1) % edges).is_some() || bulge(i % edges).is_some() {
             return (v, v, None);
         }
         let (din, dout) = (dir[(i + edges - 1) % edges], dir[i % edges]);
@@ -396,6 +459,10 @@ fn fillet(points: &[[f32; 2]], closed: bool, radius: f32, names: Option<&[&str]>
         }
     };
     for e in 0..edges {
+        if let Some(b) = bulge(e) {
+            pieces.push((format!("圆弧 {}", e + 1), SegmentKind::Corner, bulge_arc(points[e], points[(e + 1) % n], b)));
+            continue;
+        }
         let (a, b) = (corners[e].1, corners[(e + 1) % n].0);
         let line = Piece::Line { a, b };
         if line.len() > 1e-4 {
@@ -430,8 +497,8 @@ impl RecipeDoc {
         if !(self.max_gap_len >= 0.0) {
             return Err("允许断胶长度不能为负".into());
         }
-        if self.camera >= 8 {
-            return Err("相机序号超出范围".into());
+        if !valid_camera_id(&self.camera) {
+            return Err("飞拍相机编号只能用字母、数字、- 和 _".into());
         }
         for (what, l) in [("直线段", &self.line), ("拐角", &self.corner)].into_iter().chain(self.segment_overrides.iter().map(|(k, v)| (k.as_str(), v))) {
             l.position.validate(&format!("{what} 位置"))?;
@@ -445,9 +512,12 @@ impl RecipeDoc {
                     return Err("圆角矩形的宽高需为正，圆角半径不超过短边一半".into());
                 }
             }
-            PathSpec::Polyline { ref points, radius, .. } => {
-                if points.iter().flatten().any(|v| !v.is_finite()) || radius < 0.0 {
-                    return Err("胶路点坐标必须是有限数，倒圆半径不能为负".into());
+            PathSpec::Polyline { ref points, radius, ref bulges, .. } => {
+                if points.iter().flatten().any(|v| !v.is_finite()) || radius < 0.0 || bulges.iter().any(|b| !b.is_finite()) {
+                    return Err("胶路点坐标与圆弧参数必须是有限数，倒圆半径不能为负".into());
+                }
+                if bulges.len() > points.len() {
+                    return Err("圆弧参数比胶路边数还多".into());
                 }
             }
         }
@@ -470,14 +540,19 @@ impl RecipeDoc {
         let (pieces, closed, part) = match self.path {
             PathSpec::RoundedRect { width: w, height: h, radius: r } => {
                 let pts = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]];
-                (fillet(&pts, true, r, Some(&RECT_NAMES))?, true, [w, h, r])
+                (fillet(&pts, true, r, &[], Some(&RECT_NAMES))?, true, [w, h, r])
             }
-            PathSpec::Polyline { ref points, closed, radius } => {
+            PathSpec::Polyline { ref points, closed, radius, ref bulges } => {
                 let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
                 for p in points {
                     (x0, y0, x1, y1) = (x0.min(p[0]), y0.min(p[1]), x1.max(p[0]), y1.max(p[1]));
                 }
-                (fillet(points, closed, radius, None)?, closed, [x1 - x0, y1 - y0, 0.0])
+                // 闭合轮廓常把起点在末尾再写一遍（CAD / CSV 导出都这样）：去掉，不然收尾那条边长度为 0
+                let mut pts = points.as_slice();
+                if closed && pts.len() > 3 && same_point(pts[0], pts[pts.len() - 1]) {
+                    pts = &pts[..pts.len() - 1];
+                }
+                (fillet(pts, closed, radius, bulges, None)?, closed, [x1 - x0, y1 - y0, 0.0])
             }
         };
         let limits = |name: &str, kind: SegmentKind| {
@@ -539,7 +614,7 @@ impl RecipeDoc {
             closed,
             fov: self.fov,
             shots: if follow { Vec::new() } else { self.shots.clone() },
-            camera: self.camera,
+            camera: self.camera.clone(),
             spacing: self.spacing,
             filter_window: self.filter_window,
             max_gap_len: self.max_gap_len,
@@ -593,7 +668,7 @@ fn follow_limits(bead: f32, corner: bool) -> SegmentLimits {
     }
 }
 
-pub fn default_follow_spec(cameras: Vec<u8>, speed: f32) -> FollowSpec {
+pub fn default_follow_spec(cameras: Vec<String>, speed: f32) -> FollowSpec {
     FollowSpec {
         cameras,
         timing: FollowTiming::Timed { speed_mm_s: speed, delay_ms: 300.0 },
@@ -619,7 +694,7 @@ pub fn samples() -> Vec<RecipeDoc> {
         product_code: code,
         mode: InspectMode::FlyShot,
         trigger_mode,
-        camera: 0,
+        camera: default_camera(),
         path: PathSpec::RoundedRect { width: w, height: h, radius: r },
         spacing: 0.5,
         filter_window: 5,
@@ -638,7 +713,7 @@ pub fn samples() -> Vec<RecipeDoc> {
         product_code: 21,
         mode: InspectMode::Follow,
         trigger_mode: TriggerMode::Fly,
-        camera: 0,
+        camera: default_camera(),
         path: PathSpec::RoundedRect { width: 240.0, height: 140.0, radius: 20.0 },
         spacing: 0.5,
         filter_window: 5,
@@ -648,7 +723,7 @@ pub fn samples() -> Vec<RecipeDoc> {
         segment_overrides: BTreeMap::new(),
         fov: [0.0, 0.0],
         shots: Vec::new(),
-        follow: Some(default_follow_spec(vec![0, 1, 2], 80.0)),
+        follow: Some(default_follow_spec((0..3).map(legacy_camera_id).collect(), 80.0)),
     };
     vec![
         fly(
@@ -672,56 +747,299 @@ pub fn builtin() -> Vec<Arc<Recipe>> {
     samples().iter().map(|d| Arc::new(d.build().unwrap())).collect()
 }
 
-/// 从 CSV（每行 x,y，可有表头）或 DXF（LWPOLYLINE / POLYLINE 顶点、LINE 端点）的文本读出折线点。
-pub fn parse_points(text: &str, ext: &str) -> Result<Vec<[f32; 2]>, String> {
-    let points = if ext.eq_ignore_ascii_case("dxf") { dxf_points(text) } else { csv_points(text) };
-    let mut out: Vec<[f32; 2]> = Vec::new();
-    for p in points {
-        if out.last().is_none_or(|q| (q[0] - p[0]).abs() > 1e-4 || (q[1] - p[1]).abs() > 1e-4) {
-            out.push(p);
+fn same_point(a: [f32; 2], b: [f32; 2]) -> bool {
+    (a[0] - b[0]).abs() <= 1e-3 && (a[1] - b[1]).abs() <= 1e-3
+}
+
+/// 从文件导入的胶路：折线点、各边的 bulge（直边为 0）、是否闭合。
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportedPath {
+    pub points: Vec<[f32; 2]>,
+    pub bulges: Vec<f32>,
+    pub closed: bool,
+    /// 给操作员看的说明（例如文件里有几条路径、取了哪条）
+    pub note: Option<String>,
+}
+
+impl ImportedPath {
+    /// 去掉相邻重合点；首尾重合视为闭合并去掉末点。
+    fn normalized(mut self) -> Result<Self, String> {
+        let (mut pts, mut bs): (Vec<[f32; 2]>, Vec<f32>) = (Vec::new(), Vec::new());
+        for (i, &p) in self.points.iter().enumerate() {
+            let b = self.bulges.get(i).copied().unwrap_or(0.0);
+            if pts.last().is_some_and(|&q| same_point(q, p)) {
+                // 重合点：它后面那条边的 bulge 归到保留下来的点上
+                if let Some(last) = bs.last_mut() {
+                    *last = b;
+                }
+                continue;
+            }
+            pts.push(p);
+            bs.push(b);
+        }
+        if pts.len() > 2 && same_point(pts[0], pts[pts.len() - 1]) {
+            pts.pop();
+            bs.pop();
+            self.closed = true;
+        }
+        if pts.len() < 2 {
+            return Err("文件里没读到至少 2 个点".into());
+        }
+        if !self.closed {
+            bs.truncate(pts.len() - 1);
+        }
+        if bs.iter().all(|b| b.abs() < 1e-9) {
+            bs.clear();
+        }
+        self.points = pts;
+        self.bulges = bs;
+        Ok(self)
+    }
+
+    /// 近似长度（圆弧按弧长）。
+    fn length(&self) -> f32 {
+        let n = self.points.len();
+        let edges = if self.closed { n } else { n.saturating_sub(1) };
+        (0..edges)
+            .map(|e| {
+                let (a, b) = (self.points[e], self.points[(e + 1) % n]);
+                let chord = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+                let bulge = self.bulges.get(e).copied().unwrap_or(0.0);
+                if bulge.abs() < 1e-6 {
+                    chord
+                } else {
+                    let theta = 4.0 * bulge.atan();
+                    chord / (2.0 * (theta / 2.0).sin().abs()) * theta.abs()
+                }
+            })
+            .sum()
+    }
+}
+
+/// 从 CSV（每行 x, y[, bulge]，可有表头）或 DXF 的文本读出胶路。
+/// DXF 读 ENTITIES 段里的 LWPOLYLINE / POLYLINE（含圆弧与闭合标记）、CIRCLE，以及首尾相连的 LINE / ARC；
+/// 有多条路径时取最长的一条。
+pub fn parse_path(text: &str, ext: &str) -> Result<ImportedPath, String> {
+    if ext.eq_ignore_ascii_case("dxf") {
+        dxf_path(text)
+    } else {
+        csv_path(text).normalized()
+    }
+}
+
+fn csv_path(text: &str) -> ImportedPath {
+    let mut path = ImportedPath::default();
+    for l in text.lines() {
+        let v: Vec<f32> = l.split([',', ';', '\t', ' ']).map(str::trim).filter(|s| !s.is_empty()).map_while(|s| s.parse::<f32>().ok()).collect();
+        if v.len() >= 2 && v.iter().all(|x| x.is_finite()) {
+            path.points.push([v[0], v[1]]);
+            path.bulges.push(v.get(2).copied().unwrap_or(0.0));
         }
     }
-    if out.len() < 2 {
-        return Err("文件里没读到至少 2 个点".into());
+    path
+}
+
+/// DXF 实体：组码 → 值（同一组码可能出现多次，按出现顺序）。
+struct Entity<'a> {
+    kind: &'a str,
+    pairs: Vec<(i32, &'a str)>,
+}
+
+impl Entity<'_> {
+    fn f(&self, code: i32) -> Option<f32> {
+        self.pairs.iter().find(|(c, _)| *c == code).and_then(|(_, v)| v.parse().ok())
     }
-    Ok(out)
 }
 
-fn csv_points(text: &str) -> Vec<[f32; 2]> {
-    text.lines()
-        .filter_map(|l| {
-            let mut it = l.split([',', ';', '\t', ' ']).map(str::trim).filter(|s| !s.is_empty());
-            let x = it.next()?.parse::<f32>().ok()?;
-            let y = it.next()?.parse::<f32>().ok()?;
-            (x.is_finite() && y.is_finite()).then_some([x, y])
-        })
-        .collect()
-}
-
-fn dxf_points(text: &str) -> Vec<[f32; 2]> {
+fn dxf_entities(text: &str) -> Vec<Entity<'_>> {
     let lines: Vec<&str> = text.lines().map(str::trim).collect();
-    let mut out = Vec::new();
-    let mut entity = "";
-    let mut x: Option<f32> = None;
+    let mut out: Vec<Entity> = Vec::new();
+    let mut section = "";
+    let mut in_section_header = false;
     let mut i = 0;
     while i + 1 < lines.len() {
-        let (code, value) = (lines[i], lines[i + 1]);
-        match code {
-            "0" => {
-                entity = value;
-                x = None;
+        let (Ok(code), value) = (lines[i].parse::<i32>(), lines[i + 1]) else {
+            i += 1;
+            continue;
+        };
+        i += 2;
+        if code == 0 {
+            match value {
+                "SECTION" => in_section_header = true,
+                "ENDSEC" => section = "",
+                _ => {}
             }
-            "10" | "11" if matches!(entity, "LWPOLYLINE" | "VERTEX" | "LINE") => x = value.parse().ok(),
-            "20" | "21" if matches!(entity, "LWPOLYLINE" | "VERTEX" | "LINE") => {
-                if let (Some(px), Ok(py)) = (x.take(), value.parse::<f32>()) {
-                    out.push([px, py]);
+            out.push(Entity { kind: value, pairs: Vec::new() });
+            continue;
+        }
+        if in_section_header && code == 2 {
+            section = value;
+            in_section_header = false;
+            continue;
+        }
+        if section == "ENTITIES" {
+            if let Some(e) = out.last_mut() {
+                e.pairs.push((code, value));
+            }
+        }
+    }
+    // 只留 ENTITIES 段里的实体（段名在 SECTION 后面才读到，所以按实体里有没有内容来筛）
+    out.retain(|e| !e.pairs.is_empty() || matches!(e.kind, "SEQEND"));
+    out
+}
+
+/// 一条直边或圆弧边（ARC 实体转成两端点 + bulge）。
+struct Edge {
+    a: [f32; 2],
+    b: [f32; 2],
+    bulge: f32,
+}
+
+fn chain(mut edges: Vec<Edge>) -> Vec<ImportedPath> {
+    let mut paths = Vec::new();
+    while let Some(first) = edges.pop() {
+        let mut pts = vec![first.a, first.b];
+        let mut bs = vec![first.bulge];
+        loop {
+            let end = *pts.last().unwrap();
+            let Some(i) = edges.iter().position(|e| same_point(e.a, end) || same_point(e.b, end)) else { break };
+            let e = edges.swap_remove(i);
+            if same_point(e.a, end) {
+                pts.push(e.b);
+                bs.push(e.bulge);
+            } else {
+                pts.push(e.a);
+                bs.push(-e.bulge);
+            }
+        }
+        loop {
+            let start = pts[0];
+            let Some(i) = edges.iter().position(|e| same_point(e.a, start) || same_point(e.b, start)) else { break };
+            let e = edges.swap_remove(i);
+            if same_point(e.b, start) {
+                pts.insert(0, e.a);
+                bs.insert(0, e.bulge);
+            } else {
+                pts.insert(0, e.b);
+                bs.insert(0, -e.bulge);
+            }
+        }
+        bs.push(0.0);
+        paths.push(ImportedPath { points: pts, bulges: bs, closed: false, note: None });
+    }
+    paths
+}
+
+fn dxf_path(text: &str) -> Result<ImportedPath, String> {
+    let entities = dxf_entities(text);
+    let mut paths: Vec<ImportedPath> = Vec::new();
+    let mut edges: Vec<Edge> = Vec::new();
+    let mut i = 0;
+    while i < entities.len() {
+        let e = &entities[i];
+        match e.kind {
+            "LWPOLYLINE" => {
+                let mut p = ImportedPath { closed: e.f(70).is_some_and(|f| (f as i32) & 1 == 1), ..Default::default() };
+                let mut x = None;
+                for &(code, v) in &e.pairs {
+                    match code {
+                        10 => x = v.parse::<f32>().ok(),
+                        20 => {
+                            if let (Some(px), Ok(py)) = (x.take(), v.parse::<f32>()) {
+                                p.points.push([px, py]);
+                                p.bulges.push(0.0);
+                            }
+                        }
+                        // bulge 跟在它所属的顶点之后，作用于从这个顶点出发的那条边
+                        42 => {
+                            if let (Some(b), Ok(v)) = (p.bulges.last_mut(), v.parse::<f32>()) {
+                                *b = v;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                paths.push(p);
+            }
+            "POLYLINE" => {
+                let mut p = ImportedPath { closed: e.f(70).is_some_and(|f| (f as i32) & 1 == 1), ..Default::default() };
+                while i + 1 < entities.len() && entities[i + 1].kind == "VERTEX" {
+                    i += 1;
+                    let v = &entities[i];
+                    if let (Some(x), Some(y)) = (v.f(10), v.f(20)) {
+                        p.points.push([x, y]);
+                        p.bulges.push(v.f(42).unwrap_or(0.0));
+                    }
+                }
+                paths.push(p);
+            }
+            "LINE" => {
+                if let (Some(x0), Some(y0), Some(x1), Some(y1)) = (e.f(10), e.f(20), e.f(11), e.f(21)) {
+                    edges.push(Edge { a: [x0, y0], b: [x1, y1], bulge: 0.0 });
+                }
+            }
+            "ARC" => {
+                if let (Some(cx), Some(cy), Some(r), Some(a0), Some(a1)) = (e.f(10), e.f(20), e.f(40), e.f(50), e.f(51)) {
+                    let mut sweep = (a1 - a0).rem_euclid(360.0);
+                    if sweep < 1e-6 {
+                        sweep = 360.0;
+                    }
+                    let at = |deg: f32| [cx + r * deg.to_radians().cos(), cy + r * deg.to_radians().sin()];
+                    edges.push(Edge { a: at(a0), b: at(a1), bulge: (sweep.to_radians() / 4.0).tan() });
+                }
+            }
+            "CIRCLE" => {
+                if let (Some(cx), Some(cy), Some(r)) = (e.f(10), e.f(20), e.f(40)) {
+                    paths.push(ImportedPath { points: vec![[cx + r, cy], [cx - r, cy]], bulges: vec![1.0, 1.0], closed: true, note: None });
                 }
             }
             _ => {}
         }
-        i += 2;
+        i += 1;
     }
-    out
+    paths.extend(chain(edges));
+    let mut paths: Vec<ImportedPath> = paths.into_iter().filter_map(|p| p.normalized().ok()).collect();
+    if paths.is_empty() {
+        return Err("DXF 的 ENTITIES 段里没找到 LWPOLYLINE / POLYLINE / LINE / ARC / CIRCLE 组成的路径".into());
+    }
+    paths.sort_by(|a, b| b.length().total_cmp(&a.length()));
+    let n = paths.len();
+    let mut best = paths.swap_remove(0);
+    if n > 1 {
+        best.note = Some(format!("文件里有 {n} 条路径，取了最长的一条（约 {:.1} mm）", best.length()));
+    }
+    Ok(best)
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+
+    #[test]
+    fn closed_csv_repeating_first_point() {
+        let p = parse_path("x,y\n0,0\n100,0\n100,50\n0,50\n0,0\n", "csv").unwrap();
+        assert!(p.closed);
+        assert_eq!(p.points.len(), 4);
+    }
+
+    #[test]
+    fn dxf_lines_and_arc_chain_into_rounded_path() {
+        // 两条直线 + 一段 90° 圆弧（半径 10），故意打乱顺序、反向书写
+        let dxf = "0\nSECTION\n2\nENTITIES\n\
+                   0\nLINE\n10\n110\n20\n10\n11\n110\n21\n60\n\
+                   0\nARC\n10\n100\n20\n10\n40\n10\n50\n270\n51\n0\n\
+                   0\nLINE\n10\n0\n20\n0\n11\n100\n21\n0\n\
+                   0\nENDSEC\n0\nEOF\n";
+        let p = parse_path(dxf, "dxf").unwrap();
+        assert!(!p.closed);
+        assert_eq!(p.points.len(), 4);
+        let doc = RecipeDoc { path: PathSpec::Polyline { points: p.points.clone(), closed: false, radius: 0.0, bulges: p.bulges.clone() }, ..samples()[2].clone() };
+        let r = doc.build().unwrap();
+        let total = r.segments.last().unwrap().s1;
+        assert!((total - (100.0 + 50.0 + std::f32::consts::PI * 5.0)).abs() < 0.05, "全长 {total}");
+        assert!(r.segments.iter().any(|g| g.kind == SegmentKind::Corner));
+    }
 }
 
 /// 磁盘上的配方库：每个配方一个 `<id>.json`。
@@ -850,7 +1168,7 @@ mod tests {
     #[test]
     fn open_polyline_fillet() {
         let doc = RecipeDoc {
-            path: PathSpec::Polyline { points: vec![[0.0, 0.0], [100.0, 0.0], [100.0, 50.0]], closed: false, radius: 10.0 },
+            path: PathSpec::Polyline { points: vec![[0.0, 0.0], [100.0, 0.0], [100.0, 50.0]], closed: false, radius: 10.0, bulges: Vec::new() },
             ..samples()[2].clone()
         };
         let r = doc.build().unwrap();

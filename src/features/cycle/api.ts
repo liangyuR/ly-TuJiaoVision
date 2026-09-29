@@ -1,7 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { useEffect, useState } from "react";
 import { subscribe } from "../plc";
-import type { CycleSettings, InspectMode, LogLine, Measured, Recipe, RecipeDoc, RecipeSummary, Scenario, SimStatus, Snapshot } from "./types";
+import type { CycleSettings, ImportedPath, InspectMode, LogLine, Measured, Recipe, RecipeDoc, RecipeSummary, Scenario, SimStatus, Snapshot } from "./types";
 
 function call<T>(cmd: string, args: Record<string, unknown> | undefined, fallback: () => T): Promise<T> {
   if (!isTauri()) return Promise.resolve(fallback());
@@ -53,7 +53,8 @@ export const recipeApi = {
       layoutCache.clear();
       notifyRecipes();
     }),
-  parsePoints: (text: string, fileName: string) => call<[number, number][]>("recipe_parse_points", { text, fileName }, () => []),
+  parsePath: (text: string, fileName: string) =>
+    call<ImportedPath>("recipe_parse_path", { text, fileName }, () => ({ points: [], bulges: [], closed: false, note: null })),
 };
 
 const layoutCache = new Map<string, Promise<Recipe | null>>();

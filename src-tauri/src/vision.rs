@@ -276,16 +276,21 @@ impl VisionHost {
 }
 
 /// 工位标定文件（标定属于相机工位，换型不重标）。
-pub fn station_calib_path(app: &AppHandle, cam: u8) -> Result<PathBuf, String> {
-    // 第 1 台沿用单相机时代的文件名
-    let name = if cam == 0 { "plane_calib.json".to_string() } else { format!("plane_calib_cam{}.json", cam + 1) };
+/// 工位标定文件按相机编号存（增删别的相机也跟着这台相机走）；cam1 沿用单相机时代的文件名。
+pub fn station_calib_path(app: &AppHandle, cam_id: &str) -> Result<PathBuf, String> {
+    let name = if cam_id == crate::recipe::legacy_camera_id(0) { "plane_calib.json".to_string() } else { format!("plane_calib_{cam_id}.json") };
     Ok(app.path().app_config_dir().map_err(|e| e.to_string())?.join("calib").join(name))
+}
+
+fn camera_id(app: &AppHandle, cam: u8) -> Result<String, String> {
+    Ok(app.state::<CycleHost>().camera.slot(cam as usize).ok_or("相机不存在")?.config().id)
 }
 
 /// 配方在当前相机下的视觉资料。模拟相机按名义几何自动生成（按配方哈希缓存）；
 /// 真实相机用示教向导的产物，标定取工位标定文件。
 pub fn assets_for(app: &AppHandle, recipe: &Recipe) -> Result<Arc<VisionAssets>, String> {
-    let slot = app.state::<CycleHost>().camera.slot(recipe.camera as usize).ok_or("配方用的相机不在相机组里")?;
+    let rig = &app.state::<CycleHost>().camera;
+    let slot = rig.index_of(&recipe.camera).and_then(|i| rig.slot(i as usize)).ok_or_else(|| format!("配方用的相机 {} 不在相机组里", recipe.camera))?;
     let source = slot.config().source;
     let host = app.state::<VisionHost>();
     let key = format!("{source:?}:{}:{}", recipe.id, recipe.hash);
@@ -320,7 +325,7 @@ pub fn assets_for(app: &AppHandle, recipe: &Recipe) -> Result<Arc<VisionAssets>,
             if a.recipe_hash != recipe.geometry_hash() {
                 return Err(format!("配方 {} 的胶路或拍照点改过，需要重新示教", recipe.id));
             }
-            a.calib = station_calib_path(app, recipe.camera)?;
+            a.calib = station_calib_path(app, &recipe.camera)?;
             a
         }
     };
@@ -359,7 +364,7 @@ fn calib_info(path: &Path) -> Option<CalibInfo> {
 
 #[tauri::command]
 pub fn vision_calib_info(app: AppHandle, cam: Option<u8>) -> Result<Option<CalibInfo>, String> {
-    Ok(calib_info(&station_calib_path(&app, cam.unwrap_or(0))?))
+    Ok(calib_info(&station_calib_path(&app, &camera_id(&app, cam.unwrap_or(0))?)?))
 }
 
 /// 工位标定：用飞拍相机最近一帧整图跑 image.board_calib，结果存成工位标定文件。
@@ -394,7 +399,7 @@ pub async fn vision_calibrate(app: AppHandle, pattern: [f64; 2], square: f64, ca
             });
         }
         let data = r.record("calib").cloned().ok_or("标定没有输出")?;
-        let path = station_calib_path(&app, cam.unwrap_or(0))?;
+        let path = station_calib_path(&app, &camera_id(&app, cam.unwrap_or(0))?)?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }

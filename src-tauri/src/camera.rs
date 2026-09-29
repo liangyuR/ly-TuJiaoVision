@@ -58,6 +58,8 @@ pub enum Acquisition {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CameraConfig {
+    /// 相机编号，配方用它引用相机；建相机时分配，之后不变（增删别的相机也不变）
+    pub id: String,
     pub name: String,
     pub source: CameraSource,
     pub serial: String,
@@ -81,6 +83,7 @@ pub struct CameraConfig {
 impl Default for CameraConfig {
     fn default() -> Self {
         Self {
+            id: String::new(),
             name: "相机".into(),
             source: CameraSource::Sim,
             serial: String::new(),
@@ -132,6 +135,7 @@ struct RigFile {
 #[serde(rename_all = "camelCase")]
 pub struct CameraStatus {
     pub cam: u8,
+    pub id: String,
     pub name: String,
     pub source: CameraSource,
     pub acquisition: Acquisition,
@@ -433,6 +437,7 @@ impl CameraSlot {
         };
         CameraStatus {
             cam: self.shared.cam,
+            id: config.id.clone(),
             name: config.name.clone(),
             source: config.source,
             acquisition: config.acquisition,
@@ -452,6 +457,15 @@ impl CameraSlot {
 
     pub fn last_full(&self) -> Option<Arc<FrameImage>> {
         self.shared.last_full.lock().unwrap().clone()
+    }
+
+    /// 只看就绪与否，不拼状态文字（节拍每 20 ms 查一次）。
+    pub fn is_ready(&self) -> bool {
+        match self.config.lock().unwrap().source {
+            CameraSource::Sim => true,
+            CameraSource::Mvs => self.device.lock().unwrap().is_some() && !self.shared.disconnected.load(Ordering::SeqCst),
+            CameraSource::Replay => self.replay.lock().unwrap().is_some(),
+        }
     }
 
     fn next_counters(&self) -> (u64, u64) {
@@ -731,6 +745,7 @@ impl CameraRig {
             let old = std::fs::read_to_string(dir.join("camera.json")).ok().and_then(|s| serde_json::from_str::<CameraConfig>(&s).ok());
             file.cameras.push(CameraConfig { name: "相机 1".into(), ..old.unwrap_or_default() });
         }
+        let assigned = assign_ids(&mut file.cameras);
         let rig = Arc::new(RigShared {
             app: app.clone(),
             tx,
@@ -743,7 +758,26 @@ impl CameraRig {
             stream_started: Mutex::new(None),
         });
         let slots = file.cameras.into_iter().enumerate().map(|(i, c)| Arc::new(CameraSlot::new(&rig, i as u8, c))).collect();
-        Ok(Self { rig, slots: RwLock::new(slots), path })
+        let this = Self { rig, slots: RwLock::new(slots), path };
+        if assigned {
+            this.save()?;
+        }
+        Ok(this)
+    }
+
+    /// 编号为 id 的相机在相机组里的序号。
+    pub fn index_of(&self, id: &str) -> Option<u8> {
+        self.slots().iter().position(|s| s.config.lock().unwrap().id == id).map(|i| i as u8)
+    }
+
+    /// 把配方里的相机编号换成此刻的相机组序号；有不在相机组里的返回错误。
+    pub fn resolve(&self, ids: &[String]) -> Result<Vec<u8>, String> {
+        ids.iter().map(|id| self.index_of(id).ok_or_else(|| format!("相机组里没有编号为 {id} 的相机"))).collect()
+    }
+
+    /// 各相机累计被丢弃的帧。
+    pub fn dropped_total(&self) -> u64 {
+        self.slots().iter().map(|s| s.shared.dropped.load(Ordering::Relaxed)).sum()
     }
 
     fn save(&self) -> Result<(), String> {
@@ -762,10 +796,6 @@ impl CameraRig {
         self.slots.read().unwrap().get(cam).cloned()
     }
 
-    pub fn len(&self) -> usize {
-        self.slots.read().unwrap().len()
-    }
-
     pub fn configs(&self) -> Vec<CameraConfig> {
         self.slots().iter().map(|s| s.config()).collect()
     }
@@ -774,13 +804,13 @@ impl CameraRig {
         self.slots().iter().map(|s| s.status()).collect()
     }
 
-    /// 给定的相机都就绪；有未就绪的返回第一台的原因。
-    pub fn check_ready(&self, cams: &[u8]) -> Result<(), String> {
+    /// 给定编号的相机都在相机组里且就绪；否则返回第一台的原因。
+    pub fn check_ready(&self, ids: &[String]) -> Result<(), String> {
         let slots = self.slots();
-        for &c in cams {
-            let Some(slot) = slots.get(c as usize) else { return Err(format!("相机组里没有第 {} 台相机", c + 1)) };
-            let st = slot.status();
-            if !st.ready {
+        for c in self.resolve(ids)? {
+            let slot = &slots[c as usize];
+            if !slot.is_ready() {
+                let st = slot.status();
                 return Err(format!("{}未就绪：{}", st.name, st.message));
             }
         }
@@ -917,16 +947,37 @@ pub fn camera_rig_config(cycle: State<'_, CycleHost>) -> Vec<CameraConfig> {
 
 /// 保存并应用一台相机的配置。返回相机未接受的参数。
 #[tauri::command]
-pub async fn camera_save_config(app: AppHandle, cam: usize, config: CameraConfig) -> Result<Vec<String>, String> {
+pub async fn camera_save_config(app: AppHandle, cam: usize, mut config: CameraConfig) -> Result<Vec<String>, String> {
     config.validate()?;
     let slot = rig(&app).slot(cam).ok_or("相机不存在")?;
+    // 编号是配方引用相机的依据，不能改
+    config.id = slot.config().id;
     slot.set_config(config);
     rig(&app).save()?;
     let _ = app.state::<CycleHost>().tx.send(cycle::Input::Refresh);
     tauri::async_runtime::spawn_blocking(move || slot.apply_config()).await.map_err(|e| e.to_string())?
 }
 
-/// 相机组增删只能在空闲或故障时做：相机序号会重排。
+/// 没有编号或编号重复的相机按位置补一个没用过的 "cam{n}"（旧配方里的相机序号 k 就对应 "cam{k+1}"）。返回是否改过。
+fn assign_ids(configs: &mut [CameraConfig]) -> bool {
+    let mut used: Vec<String> = Vec::new();
+    let mut changed = false;
+    for i in 0..configs.len() {
+        let id = configs[i].id.clone();
+        if !crate::recipe::valid_camera_id(&id) || used.contains(&id) {
+            let mut n = i + 1;
+            while used.contains(&format!("cam{n}")) || configs.iter().any(|c| c.id == format!("cam{n}")) {
+                n += 1;
+            }
+            configs[i].id = format!("cam{n}");
+            changed = true;
+        }
+        used.push(configs[i].id.clone());
+    }
+    changed
+}
+
+/// 相机组增删只能在空闲或故障时做：相机序号会重排（编号不变）。
 fn check_idle(cycle: &CycleHost) -> Result<(), String> {
     if matches!(cycle.phase(), Phase::Idle | Phase::Fault) {
         Ok(())
@@ -936,7 +987,7 @@ fn check_idle(cycle: &CycleHost) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn camera_add(app: AppHandle, config: CameraConfig) -> Result<usize, String> {
+pub fn camera_add(app: AppHandle, mut config: CameraConfig) -> Result<usize, String> {
     config.validate()?;
     let cycle = app.state::<CycleHost>();
     check_idle(&cycle)?;
@@ -944,7 +995,9 @@ pub fn camera_add(app: AppHandle, config: CameraConfig) -> Result<usize, String>
     if configs.len() >= 8 {
         return Err("相机组最多 8 台".into());
     }
+    config.id = String::new();
     configs.push(config);
+    assign_ids(&mut configs);
     let n = configs.len();
     cycle.camera.rebuild(&app, configs);
     cycle.camera.save()?;

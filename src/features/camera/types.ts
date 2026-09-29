@@ -12,6 +12,8 @@ export interface FollowCalib {
 }
 
 export interface CameraConfig {
+  /** 相机编号：配方用它引用相机，建相机时分配、之后不变 */
+  id: string;
   name: string;
   source: CameraSource;
   serial: string;
@@ -40,6 +42,7 @@ export interface DeviceSummary {
 
 export interface CameraStatus {
   cam: number;
+  id: string;
   name: string;
   source: CameraSource;
   acquisition: Acquisition;

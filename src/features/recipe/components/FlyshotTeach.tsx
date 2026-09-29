@@ -16,8 +16,9 @@ interface TeachStatus {
  * 平移旋转对齐到实际内边；框选模板（跨内边与特征孔，避开胶条）后保存。
  */
 export default function FlyshotTeach({ recipe }: { recipe: Recipe }) {
-  const { lastFrame } = useRigStatus();
-  const cam = recipe.camera;
+  const { statuses, lastFrame } = useRigStatus();
+  // 配方按编号引用相机，取图、触发按它此刻在相机组里的序号
+  const cam = statuses.find((s) => s.id === recipe.camera)?.cam ?? 0;
   const { img, canvas } = usePreviewCanvas(cam, lastFrame[cam]?.frameCounter);
   const svg = useRef<SVGSVGElement>(null);
   const [status, setStatus] = useState<TeachStatus | null>(null);
@@ -100,7 +101,7 @@ export default function FlyshotTeach({ recipe }: { recipe: Recipe }) {
         <span className="spacer" />
         <button className="btn" onClick={trigger}>
           <Zap size={15} />
-          取一帧（相机 {cam + 1}）
+          取一帧（{recipe.camera}）
         </button>
         <button className="btn primary" onClick={save} disabled={!img}>
           <Save size={15} />

@@ -124,7 +124,8 @@ pub fn teach_flyshot_status(app: AppHandle, cycle: State<'_, CycleHost>, recipe_
     let taught = (0..recipe.shot_count())
         .map(|k| !stale && assets.as_ref().and_then(|a| a.shots.get(k)).is_some_and(|s| !s.template.as_os_str().is_empty() && s.template.exists()))
         .collect();
-    let mm_per_px = vision::vision_calib_info(app.clone(), Some(recipe.camera)).ok().flatten().and_then(|c| c.mm_per_px);
+    let cam = cycle.camera.index_of(&recipe.camera);
+    let mm_per_px = cam.and_then(|c| vision::vision_calib_info(app.clone(), Some(c)).ok().flatten()).and_then(|c| c.mm_per_px);
     Ok(TeachStatus { dir: dir.display().to_string(), taught, stale, mm_per_px })
 }
 
@@ -152,7 +153,8 @@ pub fn teach_flyshot_save(app: AppHandle, cycle: State<'_, CycleHost>, teach: Sh
     if !(teach.mm_per_px > 0.0) {
         return Err("像素当量需为正".into());
     }
-    let img = cycle.camera.last_full(recipe.camera).ok_or("还没有整帧图像：打开图像测量后软触发一帧")?;
+    let cam = cycle.camera.index_of(&recipe.camera).ok_or_else(|| format!("配方用的相机 {} 不在相机组里", recipe.camera))?;
+    let img = cycle.camera.last_full(cam).ok_or("还没有整帧图像：打开图像测量后软触发一帧")?;
     let [x, y, w, h] = teach.rect;
     if w < 16 || h < 16 || x + w > img.width || y + h > img.height {
         return Err("模板矩形太小或超出图像".into());
@@ -187,7 +189,7 @@ pub fn teach_flyshot_save(app: AppHandle, cycle: State<'_, CycleHost>, teach: Sh
         recipe_id: recipe.id.clone(),
         recipe_hash: geometry,
         sim_mm_per_px: None,
-        calib: vision::station_calib_path(&app, recipe.camera)?,
+        calib: vision::station_calib_path(&app, &recipe.camera)?,
         shots: Vec::new(),
     });
     let empty = ShotAssets { template: PathBuf::new(), anchor: [0.0, 0.0], stations: PathBuf::new() };

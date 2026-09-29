@@ -170,23 +170,24 @@ export default function InspectPage() {
               {layout ? <TrajectoryMap layout={layout} vis={vis} current={cur} focus={focus} nozzle={nozzle} className="traj" /> : <div className="empty">等待配方</div>}
             </div>
             <div className={`cam-tiles n${cams.length}`}>
-              {cams.map((c) => {
-                const st = statuses.find((s) => s.cam === c);
+              {cams.map((id) => {
+                // 配方按编号引用相机，帧与测量结果按相机组序号记
+                const st = statuses.find((s) => s.id === id);
                 return st ? (
                   <CameraTile
-                    key={c}
+                    key={id}
                     status={st}
-                    calib={follow ? (configs[c]?.follow ?? null) : null}
-                    last={lastByCam[c] ?? null}
-                    active={follow ? part?.activeCam === c && phase === "ACQUIRE" : cur >= 0}
-                    frame={lastFrame[c]}
+                    calib={follow ? (configs[st.cam]?.follow ?? null) : null}
+                    last={lastByCam[st.cam] ?? null}
+                    active={follow ? part?.activeCam === st.cam && phase === "ACQUIRE" : cur >= 0}
+                    frame={lastFrame[st.cam]}
                   />
                 ) : (
-                  <div key={c} className="cam-tile down">
+                  <div key={id} className="cam-tile down">
                     <div className="cam-tile-head">
-                      <b>相机 {c + 1}</b>
+                      <b>{id}</b>
                     </div>
-                    <div className="empty small">不在相机组里</div>
+                    <div className="empty small">相机组里没有这个编号的相机</div>
                   </div>
                 );
               })}
