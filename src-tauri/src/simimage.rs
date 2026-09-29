@@ -144,7 +144,8 @@ fn view(recipe: &Recipe, k: usize) -> (f64, f64, u32, u32) {
     (cx - fw / 2.0, cy - fh / 2.0, (fw / SIM_MM_PER_PX).round() as u32, (fh / SIM_MM_PER_PX).round() as u32)
 }
 
-fn noise(i: u64, seed: u64) -> f64 {
+/// 由像素序号与种子得到 [-1, 1) 的确定性噪声（splitmix64）。
+pub fn noise(i: u64, seed: u64) -> f64 {
     let mut z = i.wrapping_add(seed.wrapping_mul(0x9E3779B97F4A7C15));
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);

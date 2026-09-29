@@ -86,26 +86,51 @@ export function useRigStatus() {
   return { statuses, lastFrame };
 }
 
-/** 某台相机的最近一帧缩略图：有新帧（frameKey 变了）才取，两次之间至少隔 intervalMs。 */
+/**
+ * 某台相机的最近一帧缩略图：有新帧（frameKey 变了）才取，两次之间至少隔 intervalMs。
+ * 已经发出去的请求不因为又来了新帧而作废，否则帧来得比取图快时画面永远不更新。
+ */
 export function usePreview(cam: number, frameKey: unknown, intervalMs = 250) {
   const [img, setImg] = useState<PreviewImage | null>(null);
   const lastAt = useRef(0);
+  const pending = useRef(false);
+  const current = useRef({ cam, mounted: true });
+  current.current.cam = cam;
   useEffect(() => {
-    let alive = true;
+    current.current.mounted = true;
+    return () => {
+      current.current.mounted = false;
+    };
+  }, []);
+  useEffect(() => {
+    if (pending.current) return;
     const t = setTimeout(
       () => {
+        pending.current = true;
         lastAt.current = Date.now();
         cameraApi
           .preview(cam)
-          .then((p) => alive && p && setImg(p))
-          .catch(() => undefined);
+          .then((p) => p && current.current.mounted && current.current.cam === cam && setImg(p))
+          .catch(() => undefined)
+          .finally(() => (pending.current = false));
       },
       Math.max(0, intervalMs - (Date.now() - lastAt.current)),
     );
-    return () => {
-      alive = false;
-      clearTimeout(t);
-    };
+    return () => clearTimeout(t);
   }, [cam, frameKey, intervalMs]);
   return img;
+}
+
+/** 缩略图画到 canvas 上：返回图像（含原图尺寸）与要挂到 canvas 上的 ref。 */
+export function usePreviewCanvas(cam: number, frameKey: unknown, intervalMs = 250) {
+  const img = usePreview(cam, frameKey, intervalMs);
+  const canvas = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    const el = canvas.current;
+    if (!el || !img) return;
+    el.width = img.width;
+    el.height = img.height;
+    el.getContext("2d")?.putImageData(img.data, 0, 0);
+  }, [img]);
+  return { img, canvas };
 }

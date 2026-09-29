@@ -204,7 +204,9 @@ struct RigShared {
     app: AppHandle,
     tx: Sender<Frame>,
     pool: FramePool,
-    capture_full: AtomicBool,
+    /// 需要整帧图像：触发采集的相机（飞拍）与连续采集的相机（随动）分开，飞拍用模拟测量时不必拷整帧
+    capture_triggered: AtomicBool,
+    capture_free_run: AtomicBool,
     streaming: AtomicBool,
     dry_run: Mutex<Option<(Instant, Vec<DryFrame>)>>,
     sim_source: Mutex<Option<SimSource>>,
@@ -228,6 +230,10 @@ struct Shared {
 }
 
 impl Shared {
+    fn capture(&self) -> bool {
+        if self.free_run.load(Ordering::Relaxed) { &self.rig.capture_free_run } else { &self.rig.capture_triggered }.load(Ordering::Relaxed)
+    }
+
     /// 连续采集且不在布防期间的帧只更新缩略图，不送节拍。
     fn wanted(&self) -> bool {
         !self.free_run.load(Ordering::Relaxed) || self.rig.streaming.load(Ordering::Relaxed)
@@ -239,8 +245,9 @@ impl Shared {
 
     fn deliver_in_order(&self, seq: u64, frame: Option<Frame>) {
         let mut order = self.order.lock().unwrap();
+        // 每台相机的帧序号从 1 开始；不能拿先到的那帧当起点，否则先合成完的第 2 帧会把第 1 帧挤到后面
         if order.next == 0 {
-            order.next = seq;
+            order.next = 1;
         }
         if seq < order.next {
             drop(order);
@@ -328,7 +335,7 @@ extern "system" fn on_image(data: *mut u8, info: *mut FrameInfo, user: *mut c_vo
             *shared.preview.lock().unwrap() = Some(make_preview(src, w as usize, h as usize));
         }
         let image = src
-            .filter(|_| shared.rig.capture_full.load(Ordering::Relaxed) && shared.wanted())
+            .filter(|_| shared.capture() && shared.wanted())
             .map(|src| Arc::new(shared.rig.pool.copy(w, h, src)));
         shared.deliver(Frame { cam: shared.cam, frame_counter, trigger_counter, lost_packets: info.lost_packet, ts: now_ms(), image });
     }));
@@ -452,14 +459,17 @@ impl CameraSlot {
     }
 
     /// 回放的下一张图片路径（到末尾后从头再来）。
+    /// 下一张回放图。连续采集按录制时刻回放时放完为止（下次布防再从头）；其余情况到末尾后从头再来。
     fn next_replay(&self) -> Option<PathBuf> {
+        let free_run = self.config().acquisition == Acquisition::FreeRun;
         let mut guard = self.replay.lock().unwrap();
         let r = guard.as_mut()?;
-        if r.times.is_some() && r.next >= r.files.len() {
+        let once = free_run && r.times.is_some();
+        if once && r.next >= r.files.len() {
             return None;
         }
         let p = r.files[r.next % r.files.len()].clone();
-        r.next = if r.times.is_some() { r.next + 1 } else { (r.next + 1) % r.files.len() };
+        r.next = if once { r.next + 1 } else { (r.next + 1) % r.files.len() };
         Some(p)
     }
 
@@ -579,7 +589,7 @@ impl CameraSlot {
         self.shared.set_preview(&img);
         let (frame_counter, trigger_counter) = self.next_counters();
         self.shared.order.lock().unwrap().next = frame_counter + 1;
-        let image = self.shared.rig.capture_full.load(Ordering::Relaxed).then(|| Arc::new(self.shared.rig.pool.adopt(img)));
+        let image = self.shared.capture().then(|| Arc::new(self.shared.rig.pool.adopt(img)));
         Some(Frame { cam: self.shared.cam, frame_counter, trigger_counter, lost_packets: 0, ts, image })
     }
 
@@ -725,7 +735,8 @@ impl CameraRig {
             app: app.clone(),
             tx,
             pool: FramePool::new(48),
-            capture_full: AtomicBool::new(false),
+            capture_triggered: AtomicBool::new(false),
+            capture_free_run: AtomicBool::new(false),
             streaming: AtomicBool::new(false),
             dry_run: Mutex::new(None),
             sim_source: Mutex::new(None),
@@ -776,13 +787,10 @@ impl CameraRig {
         Ok(())
     }
 
-    /// 取图回调是否拷贝整帧（图像测量或帧录制时打开）。
-    pub fn set_capture_full(&self, on: bool) {
-        self.rig.capture_full.store(on, Ordering::Relaxed);
-    }
-
-    pub fn capture_full(&self) -> bool {
-        self.rig.capture_full.load(Ordering::Relaxed)
+    /// 取图回调是否拷贝整帧：触发采集（飞拍）与连续采集（随动）的相机分别设置。
+    pub fn set_capture(&self, triggered: bool, free_run: bool) {
+        self.rig.capture_triggered.store(triggered, Ordering::Relaxed);
+        self.rig.capture_free_run.store(free_run, Ordering::Relaxed);
     }
 
     /// 布防期间打开：连续采集的相机开始把帧送进节拍。打开时回放从第一张开始。

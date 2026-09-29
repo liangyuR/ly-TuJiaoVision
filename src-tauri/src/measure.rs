@@ -155,8 +155,8 @@ pub fn engine(app: &AppHandle, mode: InspectMode) -> Option<Engine> {
 /// 需要整帧图像的场合：图像测量或帧录制。设置变了之后调一次。
 pub fn apply_settings(app: &AppHandle) {
     let settings = app.state::<CycleHost>().settings();
-    let on = settings.vision || settings.follow_vision || settings.record != RecordMode::Off;
-    app.state::<CycleHost>().camera.set_capture_full(on);
+    let record = settings.record != RecordMode::Off;
+    app.state::<CycleHost>().camera.set_capture(settings.vision || record, settings.follow_vision || record);
 }
 
 fn run_image(app: &AppHandle, engine: Engine, job: &Job, image: &FrameImage) -> Measured {

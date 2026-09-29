@@ -1,5 +1,4 @@
-import { useEffect, useRef } from "react";
-import { usePreview } from "../../camera/api";
+import { usePreviewCanvas } from "../../camera/api";
 import type { CameraStatus, FollowCalib, Frame } from "../../camera/types";
 import type { Measured } from "../types";
 import { CAM_COLORS } from "../vis";
@@ -16,17 +15,8 @@ interface Props {
 }
 
 export default function CameraTile({ status, calib, last, active, frame }: Props) {
-  const img = usePreview(status.cam, frame?.frameCounter);
-  const canvas = useRef<HTMLCanvasElement>(null);
+  const { img, canvas } = usePreviewCanvas(status.cam, frame?.frameCounter);
   const color = CAM_COLORS[status.cam % CAM_COLORS.length];
-
-  useEffect(() => {
-    const el = canvas.current;
-    if (!el || !img) return;
-    el.width = img.width;
-    el.height = img.height;
-    el.getContext("2d")?.putImageData(img.data, 0, 0);
-  }, [img]);
 
   const [fw, fh] = img ? [img.fullWidth, img.fullHeight] : calib ? calib.imageSize : [4, 3];
   const ok = last ? last.st.filter((s) => s === 0).length : 0;

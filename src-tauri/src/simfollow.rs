@@ -5,6 +5,7 @@ use crate::follow::{behind, FollowCalib};
 use crate::frame::FrameImage;
 use crate::recipe::Recipe;
 use crate::sim::Scenario;
+use crate::simimage;
 
 /// 场景作用的弧长区间：第 seg 段的 [a, b] 比例处。
 fn region(recipe: &Recipe, seg: usize, a: f32, b: f32) -> (f32, f32) {
@@ -47,13 +48,6 @@ pub fn gap(recipe: &Recipe, scenario: Scenario) -> Option<(f32, f32)> {
     })
 }
 
-fn noise(i: u64, seed: u64) -> f32 {
-    let mut z = i.wrapping_add(seed.wrapping_mul(0x9E3779B97F4A7C15));
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-    z ^= z >> 31;
-    (z >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
-}
 
 /// 胶嘴位于弧长 s 时这台相机的画面：亮的金属背景、暗胶条、图像下方的胶嘴。
 pub fn render(recipe: &Recipe, calib: &FollowCalib, s: f32, scenario: Scenario, seed: u64) -> FrameImage {
@@ -134,7 +128,7 @@ pub fn render(recipe: &Recipe, calib: &FollowCalib, s: f32, scenario: Scenario, 
                             val += (30.0 + 12.0 * (rn / nozzle_r) - val) * c;
                         }
                         let i = (y as u64) * w as u64 + x as u64;
-                        *v = (val + 3.0 * noise(i, seed)).round().clamp(0.0, 255.0) as u8;
+                        *v = (val + 3.0 * simimage::noise(i, seed) as f32).round().clamp(0.0, 255.0) as u8;
                     }
                 }
             });

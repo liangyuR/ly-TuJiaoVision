@@ -1,7 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { Save, Zap } from "lucide-react";
-import { cameraApi, usePreview, useRigStatus } from "../../camera";
+import { cameraApi, usePreviewCanvas, useRigStatus } from "../../camera";
 import type { Recipe } from "../../cycle/types";
 
 interface TeachStatus {
@@ -18,8 +18,7 @@ interface TeachStatus {
 export default function FlyshotTeach({ recipe }: { recipe: Recipe }) {
   const { lastFrame } = useRigStatus();
   const cam = recipe.camera;
-  const img = usePreview(cam, lastFrame[cam]?.frameCounter);
-  const canvas = useRef<HTMLCanvasElement>(null);
+  const { img, canvas } = usePreviewCanvas(cam, lastFrame[cam]?.frameCounter);
   const svg = useRef<SVGSVGElement>(null);
   const [status, setStatus] = useState<TeachStatus | null>(null);
   const [k, setK] = useState(0);
@@ -38,14 +37,6 @@ export default function FlyshotTeach({ recipe }: { recipe: Recipe }) {
       .catch((e) => setNotice({ ok: false, text: String(e) }));
   };
   useEffect(refresh, [recipe.id, recipe.hash]);
-
-  useEffect(() => {
-    const el = canvas.current;
-    if (!el || !img) return;
-    el.width = img.width;
-    el.height = img.height;
-    el.getContext("2d")?.putImageData(img.data, 0, 0);
-  }, [img]);
 
   const [fw, fh] = img ? [img.fullWidth, img.fullHeight] : [2448, 2048];
   // 名义测量点 → 像素：以图像中心为拍照点中心，按像素当量缩放，再平移旋转

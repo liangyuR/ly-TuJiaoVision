@@ -93,6 +93,46 @@ pub fn find_bead(profile: &[f32], polarity: Polarity, w_min: f32, w_max: f32) ->
     }
 }
 
+/// 在某个位置沿法向找胶条的参数（毫米）。
+#[derive(Clone, Copy, Debug)]
+pub struct Search {
+    pub search_mm: f32,
+    pub bead_width: f32,
+    pub polarity: Polarity,
+    pub min_contrast: f32,
+}
+
+impl From<&FollowSpec> for Search {
+    fn from(s: &FollowSpec) -> Self {
+        Self { search_mm: s.search_mm, bead_width: s.bead_width, polarity: s.polarity, min_contrast: s.min_contrast }
+    }
+}
+
+/// 一个位置上的卡尺读数。
+#[derive(Clone, Copy, Debug)]
+pub enum Reading {
+    /// 找到胶条：中线相对 c 沿 n 的偏移、胶宽（mm）、灰度差、中线的像素位置
+    Bead { offset_mm: f32, width_mm: f32, contrast: f32, px: [f32; 2] },
+    /// 剖面在图里但没有够对比度的胶条
+    NoBead,
+    /// 剖面出了图像
+    Outside,
+}
+
+/// 在像素 c 处沿单位向量 n 跑一次卡尺。测量、起点同步、标定试测共用这一个口径。
+pub fn read_at(img: &FrameImage, mm_per_px: f32, c: [f32; 2], n: [f32; 2], q: &Search) -> Reading {
+    let to_samples = |mm: f32| mm / mm_per_px / STEP_PX;
+    let Some(prof) = profile(img, c, n, q.search_mm / mm_per_px) else { return Reading::Outside };
+    let mid = (prof.len() / 2) as f32;
+    match find_bead(&prof, q.polarity, to_samples(q.bead_width * 0.3), to_samples(q.bead_width * 2.2)) {
+        Some(b) if b.contrast >= q.min_contrast => {
+            let off = (b.center - mid) * STEP_PX;
+            Reading::Bead { offset_mm: off * mm_per_px, width_mm: b.width * STEP_PX * mm_per_px, contrast: b.contrast, px: [c[0] + n[0] * off, c[1] + n[1] * off] }
+        }
+        _ => Reading::NoBead,
+    }
+}
+
 /// 以像素 c 为中心、沿单位向量 n 取 ±half 像素的剖面，垂直方向平均 2·BAND_PX+1 条线。出了图像返回 None。
 pub fn profile(img: &FrameImage, c: [f32; 2], n: [f32; 2], half: f32) -> Option<Vec<f32>> {
     let steps = (half / STEP_PX).ceil() as i32;
@@ -116,27 +156,18 @@ pub fn measure_follow(recipe: &Recipe, spec: &FollowSpec, calib: &FollowCalib, s
         out.error = Some(format!("图像 {}×{} 与标定时的 {}×{} 不一致，重新标定该相机", img.width, img.height, calib.image_size[0], calib.image_size[1]));
         return;
     }
-    let half_px = spec.search_mm / calib.mm_per_px;
-    let to_samples = |mm: f32| mm / calib.mm_per_px / STEP_PX;
-    let (w_min, w_max) = (to_samples(spec.bead_width * 0.3), to_samples(spec.bead_width * 2.2));
+    let q = Search::from(spec);
     let mut contrast_sum = 0.0;
     let mut found = 0usize;
     for &j in points {
         let (c, n) = follow::project(recipe, calib, s, j as usize);
-        let (d, w, st, p) = match profile(img, c, n, half_px) {
-            None => (0.0, f32::NAN, ST_INVALID, c),
-            Some(prof) => {
-                let mid = (prof.len() / 2) as f32;
-                match find_bead(&prof, spec.polarity, w_min, w_max) {
-                    Some(b) if b.contrast >= spec.min_contrast => {
-                        contrast_sum += b.contrast;
-                        found += 1;
-                        let off = (b.center - mid) * STEP_PX;
-                        let mm = off * calib.mm_per_px;
-                        (mm, b.width * STEP_PX * calib.mm_per_px, ST_OK, [c[0] + n[0] * off, c[1] + n[1] * off])
-                    }
-                    _ => (0.0, f32::NAN, ST_GAP, c),
-                }
+        let (d, w, st, p) = match read_at(img, calib.mm_per_px, c, n, &q) {
+            Reading::Outside => (0.0, f32::NAN, ST_INVALID, c),
+            Reading::NoBead => (0.0, f32::NAN, ST_GAP, c),
+            Reading::Bead { offset_mm, width_mm, contrast, px } => {
+                contrast_sum += contrast;
+                found += 1;
+                (offset_mm, width_mm, ST_OK, px)
             }
         };
         out.idx.push(j);
@@ -186,17 +217,17 @@ fn lateral_sync(recipe: &Recipe, spec: &FollowSpec, s: f32, out: &mut Measured) 
 /// 起点同步：胶条起点在窗口里时，从胶嘴往回沿名义胶路逐 0.5 mm 看有没有胶，
 /// 胶条断开处的弧长 u 就是推算误差 δ（推算 − 实际）：实际起点 s=0 在图上落在推算坐标的 u 处。
 pub fn find_start(recipe: &Recipe, spec: &FollowSpec, calib: &FollowCalib, s: f32, img: &FrameImage) -> Option<f32> {
+    let q = Search::from(spec);
     let half = spec.search_mm / calib.mm_per_px;
-    let to_samples = |mm: f32| mm / calib.mm_per_px / STEP_PX;
-    let (w_min, w_max) = (to_samples(spec.bead_width * 0.3), to_samples(spec.bead_width * 2.2));
     let nozzle = recipe.pos(s);
     let mut last_present: Option<f32> = None;
     let mut absent = 0;
     let mut u = s - spec.near_mm;
     while u >= s - spec.far_mm - spec.step_mm - 12.0 {
-        let p = recipe.pos(u);
-        let c = calib.to_px([p[0] - nozzle[0], p[1] - nozzle[1]]);
+        let here = u;
         u -= 0.5;
+        let p = recipe.pos(here);
+        let c = calib.to_px([p[0] - nozzle[0], p[1] - nozzle[1]]);
         if !calib.usable(c, half + 2.0) {
             // 靠近胶嘴的那段被挡住，跳过；已经走到图像外了就停
             if last_present.is_some() || !calib.inside(c, 0.0) {
@@ -204,10 +235,9 @@ pub fn find_start(recipe: &Recipe, spec: &FollowSpec, calib: &FollowCalib, s: f3
             }
             continue;
         }
-        let n = calib.dir_to_img(recipe.normal(u));
-        let present = profile(img, c, n, half).and_then(|prof| find_bead(&prof, spec.polarity, w_min, w_max)).is_some_and(|b| b.contrast >= spec.min_contrast);
-        if present {
-            last_present = Some(u + 0.5);
+        let n = calib.dir_to_img(recipe.normal(here));
+        if matches!(read_at(img, calib.mm_per_px, c, n, &q), Reading::Bead { .. }) {
+            last_present = Some(here);
             absent = 0;
         } else if last_present.is_some() {
             absent += 1;

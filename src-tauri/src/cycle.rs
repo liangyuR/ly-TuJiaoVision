@@ -455,11 +455,16 @@ impl Machine {
         }
     }
 
-    /// 需要就绪的相机：当前配方用到的；还不知道配方时是整个相机组。
+    /// 需要就绪的相机：当前配方用到的；还不知道配方时是所有配方用到的（没被配方用到的备用相机不拦着开工）。
     fn required_cams(&self) -> Vec<u8> {
         match self.current_recipe() {
             Some(r) => r.cameras(),
-            None => (0..host(&self.app).camera.len() as u8).collect(),
+            None => {
+                let mut cams: Vec<u8> = host(&self.app).recipes.list().iter().flat_map(|r| r.cameras()).collect();
+                cams.sort_unstable();
+                cams.dedup();
+                cams
+            }
         }
     }
 

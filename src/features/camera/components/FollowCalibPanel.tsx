@@ -1,7 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState, type MouseEvent } from "react";
 import { Crosshair, MoveUpRight, Ruler, ScanLine } from "lucide-react";
-import { cameraApi, usePreview } from "../api";
+import { cameraApi, usePreviewCanvas } from "../api";
 import type { CameraConfig, FollowCalib, Frame } from "../types";
 
 type Tool = "nozzle" | "direction" | "scale";
@@ -38,8 +38,7 @@ interface Props {
 }
 
 export default function FollowCalibPanel({ cam, config, frame, onSaved }: Props) {
-  const img = usePreview(cam, frame?.frameCounter);
-  const canvas = useRef<HTMLCanvasElement>(null);
+  const { img, canvas } = usePreviewCanvas(cam, frame?.frameCounter);
   const svg = useRef<SVGSVGElement>(null);
   const size: [number, number] = img ? [img.fullWidth, img.fullHeight] : (config.follow?.imageSize ?? [1280, 1024]);
   const [calib, setCalib] = useState<FollowCalib>(config.follow ?? defaultCalib(cam, size));
@@ -50,14 +49,6 @@ export default function FollowCalibPanel({ cam, config, frame, onSaved }: Props)
   const [probe, setProbe] = useState({ polarity: "dark" as Polarity, beadWidth: 2, searchMm: 4, nearMm: 3, farMm: 18 });
   const [points, setPoints] = useState<ProbePoint[]>([]);
   const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null);
-
-  useEffect(() => {
-    const el = canvas.current;
-    if (!el || !img) return;
-    el.width = img.width;
-    el.height = img.height;
-    el.getContext("2d")?.putImageData(img.data, 0, 0);
-  }, [img]);
 
   useEffect(() => {
     if (img && (calib.imageSize[0] !== img.fullWidth || calib.imageSize[1] !== img.fullHeight)) {

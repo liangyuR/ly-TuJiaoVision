@@ -68,7 +68,9 @@ pub fn plc_get_config(plc: State<'_, PlcHost>) -> PlcConfig {
 pub async fn plc_save_config(plc: State<'_, PlcHost>, config: PlcConfig) -> Result<(), String> {
     config.validate()?;
     config.save(&plc.config_path)?;
-    plc.engine.apply_config(config).await
+    let r = plc.engine.apply_config(config).await;
+    inspection::invalidate_tags();
+    r
 }
 
 #[tauri::command]

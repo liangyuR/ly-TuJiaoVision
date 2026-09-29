@@ -51,22 +51,15 @@ fn probe_line(img: &crate::frame::FrameImage, r: &ProbeRequest, direction_deg: f
     let (s, c) = direction_deg.to_radians().sin_cos();
     let (dir, nrm) = ([c, s], [-s, c]);
     let mmpp = r.calib.mm_per_px;
-    let half = r.search_mm / mmpp;
-    let to_samples = |mm: f32| mm / mmpp / 0.5;
+    // 试测不设灰度差门槛：看的就是能不能找到胶条
+    let q = caliper::Search { search_mm: r.search_mm, bead_width: r.bead_width, polarity: r.polarity, min_contrast: 0.0 };
     let mut points = Vec::new();
     let mut l = r.near_mm;
     while l <= r.far_mm {
         let p = [r.calib.nozzle[0] + dir[0] * l / mmpp, r.calib.nozzle[1] + dir[1] * l / mmpp];
-        let found = caliper::profile(img, p, nrm, half).and_then(|prof| {
-            let mid = (prof.len() / 2) as f32;
-            caliper::find_bead(&prof, r.polarity, to_samples(r.bead_width * 0.3), to_samples(r.bead_width * 2.2)).map(|b| (b, mid))
-        });
-        points.push(match found {
-            Some((b, mid)) => {
-                let off = (b.center - mid) * 0.5;
-                ProbePoint { l, offset: Some(off * mmpp), width: Some(b.width * 0.5 * mmpp), st: 0, px: [p[0] + nrm[0] * off, p[1] + nrm[1] * off] }
-            }
-            None => ProbePoint { l, offset: None, width: None, st: 1, px: p },
+        points.push(match caliper::read_at(img, mmpp, p, nrm, &q) {
+            caliper::Reading::Bead { offset_mm, width_mm, px, .. } => ProbePoint { l, offset: Some(offset_mm), width: Some(width_mm), st: 0, px },
+            _ => ProbePoint { l, offset: None, width: None, st: 1, px: p },
         });
         l += 0.5;
     }

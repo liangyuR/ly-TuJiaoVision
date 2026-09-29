@@ -271,10 +271,11 @@ pub async fn run(app: AppHandle, recipe: Arc<Recipe>, scenario: Scenario, contin
     loop {
         seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
         let s = scenario.resolve(seed >> 8);
-        let vision = app.state::<CycleHost>().camera.capture_full()
-            && recipe.mode == InspectMode::FlyShot
-            && matches!(recipe.path, Some(PathSpec::RoundedRect { .. }));
-        if vision && crate::measure::engine(&app, recipe.mode) == Some(Engine::LyFlow) {
+        // 模拟相机只在真要看图（lyFlow 测量或帧录制）时才合成飞拍图像，一帧 5 MP 很费 CPU
+        let lyflow = crate::measure::engine(&app, recipe.mode) == Some(Engine::LyFlow);
+        let recording = app.state::<CycleHost>().settings().record != crate::settings::RecordMode::Off;
+        let vision = (lyflow || recording) && recipe.mode == InspectMode::FlyShot && matches!(recipe.path, Some(PathSpec::RoundedRect { .. }));
+        if vision && lyflow {
             sim.set_message(&app, format!("准备 {} 的模拟示教资料…", recipe.id));
             let (a, r) = (app.clone(), recipe.clone());
             let prepared = tauri::async_runtime::spawn_blocking(move || crate::vision::assets_for(&a, &r).map(|_| ())).await;

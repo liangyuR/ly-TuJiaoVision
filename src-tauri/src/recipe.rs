@@ -223,9 +223,7 @@ impl Recipe {
     /// 只看胶路几何与拍照点的哈希：示教资料跟它走，改判定限值不用重新示教。
     pub fn geometry_hash(&self) -> String {
         let key = serde_json::json!([self.path, self.part, self.spacing, self.shots, self.fov, self.closed]);
-        let bytes = serde_json::to_vec(&key).unwrap_or_default();
-        let h = bytes.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3));
-        format!("{:016x}", h)
+        fnv_hex(&serde_json::to_vec(&key).unwrap_or_default())
     }
 
     /// 本配方要用到的相机。
@@ -557,7 +555,11 @@ impl RecipeDoc {
 
 /// 只看内容的哈希（不含版本号），检测记录按它存配方快照。
 fn content_hash(recipe: &Recipe) -> String {
-    let bytes = serde_json::to_vec(recipe).unwrap_or_default();
+    fnv_hex(&serde_json::to_vec(recipe).unwrap_or_default())
+}
+
+/// FNV-1a 64 位，十六进制。
+fn fnv_hex(bytes: &[u8]) -> String {
     let h = bytes.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3));
     format!("{:016x}", h)
 }

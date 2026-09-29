@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::RwLock;
+
 use ly_plc::{Access, ConnectionConfig, DataType, EdgeMode, HeartbeatConfig, PlcConfig, PlcEngine, PlcPoint, PlcValue};
 use serde_json::Value;
 
@@ -20,8 +23,27 @@ pub mod tag {
     pub const PATH_PROGRESS: &str = "pathProgress";
 }
 
+/// 标签 → 点位 id。随动每帧都要读进度，不能每次都把整个地址表克隆一遍；地址表保存后清空重建。
+static TAG_IDS: RwLock<Option<HashMap<String, String>>> = RwLock::new(None);
+
+pub fn invalidate_tags() {
+    *TAG_IDS.write().unwrap() = None;
+}
+
 fn point_id(engine: &PlcEngine, tag: &str) -> Option<String> {
-    engine.config().points.into_iter().find(|p| p.tags.iter().any(|t| t == tag)).map(|p| p.id)
+    if let Some(map) = TAG_IDS.read().unwrap().as_ref() {
+        return map.get(tag).cloned();
+    }
+    let mut map = HashMap::new();
+    for p in engine.config().points {
+        for t in p.tags {
+            // 同一标签挂在多个点位上时取第一个，与原来的查找顺序一致
+            map.entry(t).or_insert_with(|| p.id.clone());
+        }
+    }
+    let id = map.get(tag).cloned();
+    *TAG_IDS.write().unwrap() = Some(map);
+    id
 }
 
 pub fn read_tag(engine: &PlcEngine, tag: &str) -> Option<PlcValue> {

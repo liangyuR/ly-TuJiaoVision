@@ -1,6 +1,6 @@
 import "./camera.css";
 
-export { cameraApi, defaultCameraConfig, usePreview, useRigStatus } from "./api";
+export { cameraApi, defaultCameraConfig, usePreview, usePreviewCanvas, useRigStatus } from "./api";
 export { default as CameraConfigPanel } from "./components/CameraConfigPanel";
 export { default as FeasibilityCalc } from "./components/FeasibilityCalc";
 export { default as DryRunPanel } from "./components/DryRunPanel";

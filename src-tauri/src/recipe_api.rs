@@ -7,6 +7,7 @@ use tauri::State;
 
 use crate::cycle::{CycleHost, Input, Phase, RecipeSummary};
 use crate::recipe::{self, default_follow_spec, InspectMode, Recipe, RecipeDoc};
+use crate::settings::CycleSettings;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,6 +71,10 @@ pub fn recipe_delete(cycle: State<'_, CycleHost>, id: String) -> Result<(), Stri
         return Err("该配方正在检测中，工件结束后再删".into());
     }
     cycle.recipes.delete(&id)?;
+    // 删掉的正是人工选中的配方：清掉选择，下一件报"未选择配方"而不是拿着一个不存在的编号
+    if settings.manual_recipe_id.as_deref() == Some(id.as_str()) {
+        cycle.save_settings(CycleSettings { manual_recipe_id: None, ..settings })?;
+    }
     let _ = cycle.tx.send(Input::Refresh);
     Ok(())
 }

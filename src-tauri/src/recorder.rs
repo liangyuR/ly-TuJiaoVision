@@ -2,7 +2,8 @@
 //! 目录可以直接给回放相机用。写盘在后台线程，队列满了丢帧计数，不拖慢检测节拍。
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
 use chrono::Local;
@@ -15,6 +16,7 @@ use crate::recipe::Recipe;
 use crate::replay;
 use crate::settings::RecordMode;
 
+/// 排队等写盘的帧最多这么多，再多就丢帧计数（收尾消息不受限，不能丢）。
 const QUEUE: usize = 48;
 
 #[derive(Clone, Debug, Serialize)]
@@ -48,15 +50,17 @@ pub struct Recording {
 
 pub struct Recorder {
     root: PathBuf,
-    tx: SyncSender<Msg>,
+    tx: Sender<Msg>,
+    queued: Arc<AtomicUsize>,
 }
 
 impl Recorder {
     pub fn new(root: PathBuf) -> Self {
-        let (tx, rx) = sync_channel(QUEUE);
-        let r = root.clone();
-        std::thread::Builder::new().name("frame-recorder".into()).spawn(move || writer(r, rx)).ok();
-        Self { root, tx }
+        let (tx, rx) = channel();
+        let (r, q) = (root.clone(), Arc::new(AtomicUsize::new(0)));
+        let q2 = q.clone();
+        std::thread::Builder::new().name("frame-recorder".into()).spawn(move || writer(r, rx, q2)).ok();
+        Self { root, tx, queued: q }
     }
 
     pub fn root(&self) -> &Path {
@@ -79,17 +83,17 @@ impl Recorder {
         }
         rec.seq[cam] += 1;
         let file = format!("cam{}_{:06}.pgm", cam + 1, rec.seq[cam]);
-        match self.tx.try_send(Msg::Frame { path: rec.dir.join(&file), image }) {
-            Ok(()) => rec.frames.push(FrameMeta {
-                cam: f.cam,
-                seq: rec.seq[cam],
-                file,
-                ts: f.ts,
-                frame_counter: f.frame_counter,
-                trigger_counter: f.trigger_counter,
-            }),
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => rec.dropped += 1,
+        if self.queued.load(Ordering::Relaxed) >= QUEUE {
+            rec.dropped += 1;
+            return;
         }
+        self.queued.fetch_add(1, Ordering::Relaxed);
+        if self.tx.send(Msg::Frame { path: rec.dir.join(&file), image }).is_err() {
+            self.queued.fetch_sub(1, Ordering::Relaxed);
+            rec.dropped += 1;
+            return;
+        }
+        rec.frames.push(FrameMeta { cam: f.cam, seq: rec.seq[cam], file, ts: f.ts, frame_counter: f.frame_counter, trigger_counter: f.trigger_counter });
     }
 
     pub fn finish(&self, rec: Recording, verdict: Verdict, reason: &str, keep: u32, max_bytes: u64) {
@@ -106,12 +110,12 @@ impl Recorder {
             "frames": rec.frames,
             "droppedFrames": rec.dropped,
         });
-        // 收尾消息不能丢，否则临时目录留在那里
+        // 收尾消息不能丢，否则临时目录留在那里；通道不限长，这里不会阻塞检测节拍
         let _ = self.tx.send(Msg::Finish { pending: rec.dir, target, meta, keep, max_bytes });
     }
 }
 
-fn writer(root: PathBuf, rx: Receiver<Msg>) {
+fn writer(root: PathBuf, rx: Receiver<Msg>, queued: Arc<AtomicUsize>) {
     while let Ok(msg) = rx.recv() {
         match msg {
             Msg::Frame { path, image } => {
@@ -119,6 +123,8 @@ fn writer(root: PathBuf, rx: Receiver<Msg>) {
                     let _ = std::fs::create_dir_all(dir);
                 }
                 let _ = replay::save_pgm(&path, &image);
+                drop(image);
+                queued.fetch_sub(1, Ordering::Relaxed);
             }
             Msg::Finish { pending, target, meta, keep, max_bytes } => {
                 let _ = std::fs::create_dir_all(&pending);

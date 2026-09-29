@@ -1,20 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { Zap } from "lucide-react";
-import { cameraApi, usePreview } from "../api";
+import { cameraApi, usePreviewCanvas } from "../api";
 import type { CameraConfig, CameraStatus, Frame } from "../types";
 
 export default function FramePreview({ cam, status, lastFrame, config }: { cam: number; status: CameraStatus | null; lastFrame: Frame | undefined; config: CameraConfig | null }) {
-  const img = usePreview(cam, lastFrame?.frameCounter);
-  const canvas = useRef<HTMLCanvasElement>(null);
+  const { img, canvas } = usePreviewCanvas(cam, lastFrame?.frameCounter);
   const [error, setError] = useState("");
-
-  useEffect(() => {
-    const el = canvas.current;
-    if (!el || !img) return;
-    el.width = img.width;
-    el.height = img.height;
-    el.getContext("2d")?.putImageData(img.data, 0, 0);
-  }, [img]);
 
   const soft = () => {
     setError("");
