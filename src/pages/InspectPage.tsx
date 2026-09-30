@@ -55,27 +55,37 @@ export default function InspectPage() {
   const part = snapshot?.part ?? null;
   const layoutId = part?.recipeId ?? snapshot?.activeRecipeId ?? recipes[0]?.id;
   const summary = recipes.find((r) => r.id === layoutId);
-  const layout = useLayout(layoutId, summary?.version);
+  // 有工件时按它开工时的配方快照画：配方刚改过（比如改了间距），测量点序号对的还是那一版
+  const layout = useLayout(layoutId, part ? part.recipeHash : summary?.hash);
   const phase = snapshot?.phase ?? "IDLE";
   const settled = phase === "REPORT" || phase === "RELEASE" || phase === "IDLE" || phase === "FAULT";
   const result = settled ? (snapshot?.result ?? null) : null;
   const partResult = result && part && result.sn === part.sn ? result : null;
   const follow = layout?.mode === "follow";
+  const ownLayout = !!layout && !!part && layout.id === part.recipeId && layout.hash === part.recipeHash;
+  const shown = useMemo(() => (ownLayout ? measured : []), [ownLayout, measured]);
 
   useEffect(() => {
     cameraApi.rigConfig().then(setConfigs).catch(() => setConfigs([]));
   }, [statuses.length]);
 
-  const vis = useMemo(() => (layout ? computeVis(layout, part, measured, partResult) : []), [layout, part, measured, partResult]);
+  // 随动时快照每秒 20 次、每次都是新对象：主视图只在测量结果或结论变了时重算
+  const partKey = follow ? `${part?.sn}:${part?.recipeHash}` : part;
+  const resultKey = partResult ? `${partResult.sn}:${partResult.ts}` : null;
+  const vis = useMemo(
+    () => (layout && ownLayout ? computeVis(layout, part, shown, partResult) : []),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [layout, ownLayout, partKey, shown, resultKey],
+  );
   const cur = !follow && (phase === "ACQUIRE" || phase === "DRAIN") ? currentFrame(part) : -1;
   const focus = !follow && view === "frame" ? currentFrame(part) : null;
   const trigger = snapshot?.triggerMode ?? layout?.triggerMode;
   const cams = layout ? (follow ? (layout.follow?.cameras ?? []) : [layout.camera]) : [];
   const lastByCam = useMemo(() => {
     const out: Record<number, Measured> = {};
-    measured.forEach((m) => (out[m.cam ?? 0] = m));
+    shown.forEach((m) => (out[m.cam ?? 0] = m));
     return out;
-  }, [measured]);
+  }, [shown]);
   const nozzle = follow && part?.nozzleS != null && part.recipeId === layout?.id ? { s: part.nozzleS, cam: part.activeCam } : null;
 
   const confirmSwitch = async () => {
@@ -215,7 +225,7 @@ export default function InspectPage() {
                 {follow ? "胶条横向偏移（mm）" : "距内边距离 d（mm）"}，横轴弧长；绿色带为公差，红虚线为绝对限，底部色条为{follow ? "测到该点的相机" : "各帧负责区间"}
               </span>
             </div>
-            {layout && <UnrolledCurve layout={layout} measured={measured} vis={vis} />}
+            {layout && <UnrolledCurve layout={layout} measured={shown} vis={vis} />}
           </div>
           {follow && (
             <div className="panel">
@@ -223,7 +233,7 @@ export default function InspectPage() {
                 <h3 className="panel-title">胶宽</h3>
                 <span className="muted">mm，按段的胶宽限值判定</span>
               </div>
-              {layout && <UnrolledCurve layout={layout} measured={measured} vis={vis} quantity="w" />}
+              {layout && <UnrolledCurve layout={layout} measured={shown} vis={vis} quantity="w" />}
             </div>
           )}
         </div>
@@ -231,7 +241,7 @@ export default function InspectPage() {
         <div className="fly-side">
           <VerdictCard phase={phase} result={result} sn={part?.sn} />
           <Progress snapshot={snapshot} result={partResult} follow={follow} />
-          <SegmentPanel layout={layout} measured={measured} result={partResult} />
+          <SegmentPanel layout={layout} measured={shown} result={partResult} />
           <div className="panel">
             <h3 className="panel-title" style={{ marginBottom: 0 }}>事件</h3>
             <EventLog logs={logs} />
@@ -297,7 +307,7 @@ function Progress({ snapshot, result, follow }: { snapshot: Snapshot | null; res
             <b>{travel != null ? `${travel.toFixed(0)}%` : "—"}</b>
             <div className="bar"><i style={{ width: `${travel ?? 0}%` }} /></div>
             <span>收到帧 / 测量帧</span>
-            <b>{part ? `${part.received} / ${part.frames.length}` : "—"}</b>
+            <b>{part ? `${part.received} / ${part.measuredFrames}` : "—"}</b>
           </>
         ) : (
           <>

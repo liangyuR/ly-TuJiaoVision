@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::vision::FrameImage;
 
-const EXTS: [&str; 6] = ["pgm", "jpg", "jpeg", "png", "bmp", "tif"];
+const EXTS: [&str; 7] = ["pgm", "jpg", "jpeg", "png", "bmp", "tif", "tiff"];
 
 struct Entry {
     channel: Option<u32>,

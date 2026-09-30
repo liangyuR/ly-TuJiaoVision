@@ -1,12 +1,14 @@
 //! 示教：随动相机的胶嘴标定试测、飞拍拍照点的模板与测量点示教、帧录制目录列表。
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tauri::{AppHandle, Manager, State};
 
 use crate::caliper;
+use crate::camera::CameraSource;
 use crate::cycle::CycleHost;
 use crate::follow::FollowCalib;
 use crate::recipe::{InspectMode, Polarity};
@@ -78,7 +80,12 @@ pub async fn teach_follow_probe(app: AppHandle, request: ProbeRequest) -> Result
     tauri::async_runtime::spawn_blocking(move || {
         let r = request;
         r.calib.validate()?;
-        let img = app.state::<CycleHost>().camera.last_full(r.cam).ok_or("这台相机还没有整帧图像：打开图像测量或帧录制后取一帧")?;
+        let slot = app.state::<CycleHost>().camera.slot(r.cam as usize).ok_or("相机不存在")?;
+        // 海康相机空闲时不拷整帧，现取一张（就是画面上正在看的）；回放相机用"下一张"取到的那张
+        let img = match slot.config().source {
+            CameraSource::Mvs => slot.grab_full(Duration::from_millis(1500)).ok_or("1.5 s 内没收到这台相机的新帧：检查相机是否在出图")?,
+            _ => slot.last_full().ok_or("这台相机还没有整帧图像：回放相机先按“下一张”取一帧")?,
+        };
         if img.width != r.calib.image_size[0] || img.height != r.calib.image_size[1] {
             return Err(format!("图像是 {}×{}，标定里写的是 {}×{}", img.width, img.height, r.calib.image_size[0], r.calib.image_size[1]));
         }
@@ -100,10 +107,6 @@ pub async fn teach_follow_probe(app: AppHandle, request: ProbeRequest) -> Result
     .map_err(|e| e.to_string())?
 }
 
-fn taught_dir(app: &AppHandle, id: &str) -> Result<PathBuf, String> {
-    Ok(app.path().app_data_dir().map_err(|e| e.to_string())?.join("vision").join("taught").join(id))
-}
-
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TeachStatus {
@@ -118,14 +121,13 @@ pub struct TeachStatus {
 #[tauri::command]
 pub fn teach_flyshot_status(app: AppHandle, cycle: State<'_, CycleHost>, recipe_id: String) -> Result<TeachStatus, String> {
     let recipe = cycle.recipe(&recipe_id).ok_or("配方不存在")?;
-    let dir = taught_dir(&app, &recipe.id)?;
-    let assets = VisionAssets::load(&dir.join("vision.json"));
+    let dir = vision::taught_dir(&app, &recipe.id)?;
+    let assets = VisionAssets::load(&dir.join(vision::ASSETS_FILE));
     let stale = assets.as_ref().is_some_and(|a| a.recipe_hash != recipe.geometry_hash());
     let taught = (0..recipe.shot_count())
         .map(|k| !stale && assets.as_ref().and_then(|a| a.shots.get(k)).is_some_and(|s| !s.template.as_os_str().is_empty() && s.template.exists()))
         .collect();
-    let cam = cycle.camera.index_of(&recipe.camera);
-    let mm_per_px = cam.and_then(|c| vision::vision_calib_info(app.clone(), Some(c)).ok().flatten()).and_then(|c| c.mm_per_px);
+    let mm_per_px = vision::calib_info(&vision::station_calib_path(&app, &recipe.camera)?).and_then(|c| c.mm_per_px);
     Ok(TeachStatus { dir: dir.display().to_string(), taught, stale, mm_per_px })
 }
 
@@ -153,13 +155,13 @@ pub fn teach_flyshot_save(app: AppHandle, cycle: State<'_, CycleHost>, teach: Sh
     if !(teach.mm_per_px > 0.0) {
         return Err("像素当量需为正".into());
     }
-    let cam = cycle.camera.index_of(&recipe.camera).ok_or_else(|| format!("配方用的相机 {} 不在相机组里", recipe.camera))?;
-    let img = cycle.camera.last_full(cam).ok_or("还没有整帧图像：打开图像测量后软触发一帧")?;
+    let cam = cycle.camera.require(&recipe.camera)?;
+    let img = cycle.camera.last_full(cam).ok_or("还没有整帧图像：先取一帧")?;
     let [x, y, w, h] = teach.rect;
     if w < 16 || h < 16 || x + w > img.width || y + h > img.height {
         return Err("模板矩形太小或超出图像".into());
     }
-    let dir = taught_dir(&app, &recipe.id)?;
+    let dir = vision::taught_dir(&app, &recipe.id)?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let template = dir.join(format!("k{}.template.pgm", teach.k));
     let mut crop = Vec::with_capacity((w * h) as usize);
@@ -172,18 +174,19 @@ pub fn teach_flyshot_save(app: AppHandle, cycle: State<'_, CycleHost>, teach: Sh
     let [cx, cy] = recipe.shots[teach.k];
     let (s, c) = teach.deg.to_radians().sin_cos();
     let (icx, icy) = (img.width as f32 / 2.0 + teach.dx, img.height as f32 / 2.0 + teach.dy);
+    // 卡尺从内边往外找胶条：法向要朝胶路外侧，折线胶路的绕向不一定和圆角矩形一样
+    let sign = recipe.outward_sign();
     let (mut points, mut normals, mut ids) = (Vec::new(), Vec::new(), Vec::new());
     for j in recipe.owned_points(teach.k) {
         let (u, v) = ((recipe.points.x[j] - cx) / teach.mm_per_px, (recipe.points.y[j] - cy) / teach.mm_per_px);
-        let n = recipe.normal(j as f32 * recipe.spacing);
+        let n = recipe.normal(j as f32 * recipe.spacing).map(|x| x * sign);
         points.push(json!([icx + u * c - v * s, icy + u * s + v * c]));
         normals.push(json!([n[0] * c - n[1] * s, n[0] * s + n[1] * c]));
         ids.push(j);
     }
-    let stations = dir.join(format!("k{}.stations.json", teach.k));
-    std::fs::write(&stations, json!({"points": points, "normals": normals, "ids": ids}).to_string()).map_err(|e| e.to_string())?;
+    let stations = vision::save_stations(&dir, teach.k, points, normals, ids)?;
 
-    let file = dir.join("vision.json");
+    let file = dir.join(vision::ASSETS_FILE);
     let geometry = recipe.geometry_hash();
     let mut assets = VisionAssets::load(&file).filter(|a| a.recipe_hash == geometry).unwrap_or(VisionAssets {
         recipe_id: recipe.id.clone(),

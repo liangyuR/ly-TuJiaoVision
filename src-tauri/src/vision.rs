@@ -255,7 +255,7 @@ impl VisionHost {
             version: engine.as_ref().map(|e| e.version.clone()),
             message: match (&engine, path.filter(|p| !p.trim().is_empty())) {
                 (Some(_), _) => "已加载".into(),
-                (None, None) => "未配置 lyFlow 核心库路径，使用模拟测量".into(),
+                (None, None) => "未配置核心库路径，飞拍件会判 ERR（不用 lyFlow 时在系统设置里把飞拍改为模拟测量）".into(),
                 (None, Some(_)) => self.error.lock().unwrap().clone().unwrap_or_else(|| "加载失败".into()),
             },
         }
@@ -275,8 +275,7 @@ impl VisionHost {
     }
 }
 
-/// 工位标定文件（标定属于相机工位，换型不重标）。
-/// 工位标定文件按相机编号存（增删别的相机也跟着这台相机走）；cam1 沿用单相机时代的文件名。
+/// 工位标定文件（标定属于相机工位，换型不重标）。按相机编号存，增删别的相机也跟着这台相机走；cam1 沿用单相机时代的文件名。
 pub fn station_calib_path(app: &AppHandle, cam_id: &str) -> Result<PathBuf, String> {
     let name = if cam_id == crate::recipe::legacy_camera_id(0) { "plane_calib.json".to_string() } else { format!("plane_calib_{cam_id}.json") };
     Ok(app.path().app_config_dir().map_err(|e| e.to_string())?.join("calib").join(name))
@@ -286,11 +285,26 @@ fn camera_id(app: &AppHandle, cam: u8) -> Result<String, String> {
     Ok(app.state::<CycleHost>().camera.slot(cam as usize).ok_or("相机不存在")?.config().id)
 }
 
+/// 示教资料的清单文件名（在 taught_dir 里）。
+pub const ASSETS_FILE: &str = "vision.json";
+
+/// 真实相机的飞拍示教资料目录：按配方编号，示教向导写、测量时读。
+pub fn taught_dir(app: &AppHandle, recipe_id: &str) -> Result<PathBuf, String> {
+    Ok(app.path().app_data_dir().map_err(|e| e.to_string())?.join("vision").join("taught").join(recipe_id))
+}
+
+/// 拍照点 k 的测量点文件（lyFlow 飞拍图的 stations 输入）。
+pub fn save_stations(dir: &Path, k: usize, points: Vec<Value>, normals: Vec<Value>, ids: Vec<usize>) -> Result<PathBuf, String> {
+    let path = dir.join(format!("k{k}.stations.json"));
+    std::fs::write(&path, json!({"points": points, "normals": normals, "ids": ids}).to_string()).map_err(|e| format!("写测量点文件失败：{e}"))?;
+    Ok(path)
+}
+
 /// 配方在当前相机下的视觉资料。模拟相机按名义几何自动生成（按配方哈希缓存）；
 /// 真实相机用示教向导的产物，标定取工位标定文件。
 pub fn assets_for(app: &AppHandle, recipe: &Recipe) -> Result<Arc<VisionAssets>, String> {
     let rig = &app.state::<CycleHost>().camera;
-    let slot = rig.index_of(&recipe.camera).and_then(|i| rig.slot(i as usize)).ok_or_else(|| format!("配方用的相机 {} 不在相机组里", recipe.camera))?;
+    let slot = rig.slot(rig.require(&recipe.camera)? as usize).ok_or("相机不存在")?;
     let source = slot.config().source;
     let host = app.state::<VisionHost>();
     let key = format!("{source:?}:{}:{}", recipe.id, recipe.hash);
@@ -309,7 +323,7 @@ pub fn assets_for(app: &AppHandle, recipe: &Recipe) -> Result<Arc<VisionAssets>,
                 return Err("模拟相机只会合成圆角矩形胶路的飞拍图像".into());
             }
             let dir = root.join("sim").join(name);
-            let file = dir.join("vision.json");
+            let file = dir.join(ASSETS_FILE);
             match VisionAssets::load(&file).filter(|a| a.recipe_hash == recipe.hash && a.shots.iter().all(|s| s.template.exists())) {
                 Some(a) => a,
                 None => {
@@ -320,8 +334,7 @@ pub fn assets_for(app: &AppHandle, recipe: &Recipe) -> Result<Arc<VisionAssets>,
             }
         }
         CameraSource::Mvs | CameraSource::Replay => {
-            let dir = root.join("taught").join(&recipe.id);
-            let mut a = VisionAssets::load(&dir.join("vision.json")).ok_or_else(|| format!("配方 {} 尚未示教", recipe.id))?;
+            let mut a = VisionAssets::load(&taught_dir(app, &recipe.id)?.join(ASSETS_FILE)).ok_or_else(|| format!("配方 {} 尚未示教", recipe.id))?;
             if a.recipe_hash != recipe.geometry_hash() {
                 return Err(format!("配方 {} 的胶路或拍照点改过，需要重新示教", recipe.id));
             }
@@ -347,7 +360,7 @@ pub struct CalibInfo {
     pub ts: Option<i64>,
 }
 
-fn calib_info(path: &Path) -> Option<CalibInfo> {
+pub fn calib_info(path: &Path) -> Option<CalibInfo> {
     let doc: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     let d = doc.get("data").unwrap_or(&doc);
     let f = |k: &str| d.get(k).and_then(|v| v.as_f64());

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tauri::State;
 
+use crate::camera::Acquisition;
 use crate::cycle::{CycleHost, Input, Phase, RecipeSummary};
 use crate::recipe::{self, default_follow_spec, ImportedPath, InspectMode, Recipe, RecipeDoc};
 use crate::settings::CycleSettings;
@@ -43,10 +44,14 @@ pub fn recipe_template(cycle: State<'_, CycleHost>, mode: InspectMode) -> Recipe
     doc.id = format!("NEW-{}", doc.product_code);
     doc.name = "新配方".into();
     doc.version = 1;
+    // 默认挑采集方式对得上的相机：随动用连续采集的，飞拍用触发采集的
+    let configs = cycle.camera.configs();
+    let fit: Vec<_> = configs.iter().filter(|c| (c.acquisition == Acquisition::FreeRun) == (mode == InspectMode::Follow)).collect();
+    let pick = if fit.is_empty() { configs.iter().collect() } else { fit };
     if mode == InspectMode::Follow {
-        doc.follow = Some(default_follow_spec(cycle.camera.configs().into_iter().take(3).map(|c| c.id).collect(), 80.0));
-    } else if let Some(c) = cycle.camera.configs().into_iter().next() {
-        doc.camera = c.id;
+        doc.follow = Some(default_follow_spec(pick.iter().take(3).map(|c| c.id.clone()).collect(), 80.0));
+    } else if let Some(c) = pick.first() {
+        doc.camera = c.id.clone();
     }
     doc
 }

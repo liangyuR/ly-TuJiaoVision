@@ -148,7 +148,7 @@ async fn run_part(app: &AppHandle, recipe: &Arc<Recipe>, scenario: Scenario, vis
             TriggerMode::Fly => 450,
             TriggerMode::Stop => 1100,
         };
-        let cam = cycle.camera.index_of(&recipe.camera).ok_or_else(|| format!("配方用的相机 {} 不在相机组里", recipe.camera))?;
+        let cam = cycle.camera.require(&recipe.camera)?;
         let lost = scenario.lost_frame(n);
         let locate_fail = scenario.locate_fail_frame(n);
         // 机器人每件的定位偏差：±0.4 mm、±0.15°（模板定位要吸收它）

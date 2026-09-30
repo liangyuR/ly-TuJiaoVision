@@ -1,4 +1,5 @@
 import { Outlet, useLocation } from "react-router-dom";
+import ErrorBoundary from "./ErrorBoundary";
 import Sidebar from "./Sidebar";
 import { navItems } from "./nav";
 
@@ -14,7 +15,9 @@ export default function AppLayout() {
           <h1>{current?.label ?? ""}</h1>
         </header>
         <section className="main-body">
-          <Outlet />
+          <ErrorBoundary key={pathname}>
+            <Outlet />
+          </ErrorBoundary>
         </section>
       </main>
     </div>

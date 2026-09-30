@@ -2,6 +2,7 @@
 //! 经"相对胶嘴的位移 → 旋转（相机方位）→ 缩放（像素当量）"落到图像上。
 //! 假设胶枪在涂胶过程中姿态不变（三目方案的前提：不管往哪个方向走，总有一台相机看得到身后的胶）。
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -119,7 +120,7 @@ pub struct Tracker {
     pub offset: f32,
     start_synced: bool,
     start_probe_pending: bool,
-    /// 每次起点同步改了位置就 +1；更早发出的帧里起点附近与缺胶的读数作废
+    /// 每次起点同步改了位置就 +1；更早发出的帧里起点附近的读数作废
     pub generation: u32,
     /// 起点同步修正的量（mm）
     pub start_delta: f32,
@@ -129,53 +130,75 @@ pub struct Tracker {
     advance: f32,
 }
 
-/// PLC 进度寄存器只在轮询时读到，帧的时刻与轮询时刻差着几十毫秒：
-/// 以"值第一次读到时的轮询时刻"为基准，用相隔至少 30 ms 的两次变化估出速度，外推到帧的时刻。
-#[derive(Default)]
+/// PLC 进度寄存器只在轮询时读到，帧的时刻（拍下的时刻）与读到进度的时刻对不上：帧可能在好几次轮询之后才处理。
+/// 所以记下最近几秒的变化（值与第一次读到它的轮询时刻），按帧的时刻取值：
+/// - 帧落在两次变化之间：间隔正常就线性内插；间隔长（机器人停过，或轮询卡了）就先停在前一个值、到后一个值之前按速度赶上；
+/// - 帧在最近一次变化之后：按估出的速度外推，最多推一个间隔，两个间隔还没变就是停了，停在读到的值上。
 struct Progress {
     /// 零点：布防那一刻寄存器里的值（PLC 没清零时是上一件的终值）；读不到时用第一次读到的值。
     /// 之后读到比零点还小的值说明 PLC 清零了，零点回到 0
     zero: Option<f32>,
-    /// 最近一次变化后的值与它第一次被读到的轮询时刻
-    last: Option<(f32, i64)>,
-    /// 估速度用的基准点
-    base: Option<(f32, i64)>,
+    /// 最近几秒的变化，旧的在前
+    samples: VecDeque<(f32, i64)>,
     speed: f32,
+    /// 机器人在走时相邻两次变化的间隔（ms），初值取轮询周期
+    gap: f32,
 }
 
+/// 进度历史留这么久（ms）：处理得最晚的帧也在里面。
+const HISTORY_MS: i64 = 3000;
+
 impl Progress {
-    fn extrapolate(&mut self, value: f32, poll_ts: i64, frame_ts: i64) -> f32 {
+    fn new(zero: Option<f32>, poll_ms: f32) -> Self {
+        Self { zero, samples: VecDeque::new(), speed: 0.0, gap: poll_ms.max(10.0) }
+    }
+
+    fn update(&mut self, value: f32, poll_ts: i64) {
         let zero = *self.zero.get_or_insert(value);
         if value < zero - 1e-3 {
             self.zero = Some(0.0);
-            self.last = None;
-            self.base = None;
+            self.samples.clear();
         }
         let value = value - self.zero.unwrap();
-        if self.last.is_none_or(|(v, _)| (value - v).abs() > 1e-3) {
-            // 上一个值保持了很久：机器人刚从静止起步（起步延时、中途停顿），这一跳除以整段静止时间会把速度算得很小，
-            // 起点同步又恰好在这时做，会把这个暂时的滞后当成固定偏差记下来。静止后的第一跳只当新起点，不估速度
-            let was_still = self.last.is_some_and(|(_, t)| poll_ts - t > STILL_MS);
-            self.last = Some((value, poll_ts));
-            match self.base {
-                _ if was_still => self.base = Some((value, poll_ts)),
-                Some((bv, bt)) if poll_ts - bt >= 30 => {
-                    let inst = ((value - bv) / ((poll_ts - bt) as f32 / 1000.0)).clamp(0.0, 2000.0);
-                    self.speed = if self.speed == 0.0 { inst } else { 0.7 * self.speed + 0.3 * inst };
-                    self.base = Some((value, poll_ts));
-                }
-                None => self.base = Some((value, poll_ts)),
-                _ => {}
-            }
+        let Some(&(pv, pt)) = self.samples.back() else {
+            self.samples.push_back((value, poll_ts));
+            return;
+        };
+        if (value - pv).abs() <= 1e-3 || poll_ts <= pt {
+            return;
         }
-        let (v, t) = self.last.unwrap();
-        // 外推最多 150 ms（两三个轮询周期）：PLC 的值不再变就是机器人停了，不能一直往前推
-        v + self.speed * ((frame_ts - t).clamp(0, 150) as f32 / 1000.0)
+        let dt = (poll_ts - pt) as f32;
+        if dt > 3.0 * self.gap {
+            // 停了一会儿又动了（起步延时、中途停顿），或者轮询卡了：起步时刻不知道，这一跳不估速度。
+            // 间隔慢慢放大，轮询本来就慢时几次之后就按正常间隔估速度
+            self.gap = (self.gap * 1.5).min(dt);
+        } else {
+            let inst = ((value - pv) / (dt / 1000.0)).clamp(0.0, 2000.0);
+            self.speed = if self.speed == 0.0 { inst } else { 0.7 * self.speed + 0.3 * inst };
+            self.gap = 0.8 * self.gap + 0.2 * dt;
+        }
+        self.samples.push_back((value, poll_ts));
+        while self.samples.len() > 2 && poll_ts - self.samples[0].1 > HISTORY_MS {
+            self.samples.pop_front();
+        }
+    }
+
+    fn at(&self, frame_ts: i64) -> f32 {
+        let Some(&(v, t)) = self.samples.back() else { return 0.0 };
+        if frame_ts >= t {
+            let dt = (frame_ts - t) as f32;
+            return if dt > 2.0 * self.gap { v } else { v + self.speed * dt.min(self.gap) / 1000.0 };
+        }
+        let Some(i) = self.samples.iter().rposition(|&(_, ts)| ts <= frame_ts) else { return self.samples[0].0 };
+        let ((v0, t0), (v1, t1)) = (self.samples[i], self.samples[i + 1]);
+        let dt = (t1 - t0) as f32;
+        if dt <= 3.0 * self.gap || self.speed <= 0.0 {
+            v0 + (v1 - v0) * (frame_ts - t0) as f32 / dt
+        } else {
+            (v1 - self.speed * (t1 - frame_ts) as f32 / 1000.0).clamp(v0, v1)
+        }
     }
 }
-
-/// 进度值保持超过这么久算机器人静止过。
-const STILL_MS: i64 = 250;
 
 /// 某帧要测的点；start_probe 为真时这一帧还要找胶条起点，做起点同步。calib 是本件开工时这台相机的标定。
 pub struct Plan {
@@ -187,33 +210,44 @@ pub struct Plan {
 /// 单帧横向同步的修正量只采纳这么多，压住单帧噪声。
 const LATERAL_GAIN: f32 = 0.7;
 
+/// 开工时的 PLC 进度信息：寄存器此刻的原始值（按进度定位时当零点）与轮询周期。
+pub struct PlcStart {
+    pub zero: Option<f32>,
+    pub poll_ms: f32,
+}
+
 impl Tracker {
-    /// plc_zero：布防时 PLC 进度寄存器的原始值（按进度定位时作零点）。
-    pub fn new(recipe: Arc<Recipe>, cams: Vec<(u8, FollowCalib)>, armed_ts: i64, plc_zero: Option<f32>) -> Result<Self, String> {
+    /// image_sync：这一件是图像测量（能从图里做起点同步）；模拟测量、或配方关了自动同步时不找起点。
+    pub fn new(recipe: Arc<Recipe>, cams: Vec<(u8, FollowCalib)>, armed_ts: i64, image_sync: bool, plc: PlcStart) -> Result<Self, String> {
         let spec = recipe.follow.clone().ok_or("配方没有随动参数")?;
         if cams.is_empty() {
             return Err("随动相机都没有标定".into());
         }
         let zero = match spec.timing {
-            FollowTiming::Plc { scale } => plc_zero.map(|v| v * scale),
+            FollowTiming::Plc { scale } => plc.zero.map(|v| v * scale),
             FollowTiming::Timed { .. } => None,
         };
         let n = recipe.point_count();
         Ok(Self {
             recipe,
-            spec,
             cams,
             covered: vec![false; n],
             armed_ts,
             offset: 0.0,
-            start_synced: false,
+            start_synced: !(image_sync && spec.auto_sync),
             start_probe_pending: false,
             generation: 0,
             start_delta: 0.0,
-            plc: Progress { zero, ..Progress::default() },
+            plc: Progress::new(zero, plc.poll_ms),
             last_s: vec![None; 8],
             advance: 0.0,
+            spec,
         })
+    }
+
+    /// 按 PLC 进度定位（每帧要读进度寄存器）。
+    pub fn uses_plc(&self) -> bool {
+        matches!(self.spec.timing, FollowTiming::Plc { .. })
     }
 
     /// 胶嘴位置：按时间推算（或用 PLC 给的进度），再加上从图像里同步出来的修正。
@@ -221,7 +255,10 @@ impl Tracker {
     pub fn nozzle_s(&mut self, ts: i64, plc_progress: Option<(f32, i64)>) -> Option<f32> {
         let raw = match self.spec.timing {
             FollowTiming::Timed { speed_mm_s, delay_ms } => Some(speed_mm_s * ((ts - self.armed_ts) as f32 - delay_ms) / 1000.0),
-            FollowTiming::Plc { scale } => plc_progress.map(|(p, poll_ts)| self.plc.extrapolate(p * scale, poll_ts, ts)),
+            FollowTiming::Plc { scale } => plc_progress.map(|(p, poll_ts)| {
+                self.plc.update(p * scale, poll_ts);
+                self.plc.at(ts)
+            }),
         };
         raw.map(|s| s + self.offset)
     }
@@ -323,7 +360,7 @@ impl Tracker {
         }
     }
 
-    /// 标定过的相机里，胶嘴走完全程所需的名义弧长（含超行程）。
+    /// 胶嘴走完全程所需的名义弧长（含超行程）。
     pub fn end_s(&self) -> f32 {
         self.recipe.length() + self.spec.overrun_mm
     }
@@ -351,10 +388,51 @@ mod tests {
         assert!((p[0] - 100.0).abs() < 1e-4 && (p[1] - 198.0).abs() < 1e-4, "{p:?}");
     }
 
+    /// 机器人 80 mm/s 走 1 s、停 0.5 s 再走；PLC 每 10 ms 刷新进度（0.1 mm 一个单位），视觉按不同周期轮询。
+    /// 帧有的马上处理，有的晚 0.4 s 才处理（那时已经读到后面的进度了）。
+    #[test]
+    fn plc_progress_tracks_motion_and_holds_when_stopped() {
+        let truth = |t: i64| {
+            let t = t as f32 / 1000.0;
+            80.0 * t.min(1.0) + 80.0 * (t - 1.5).max(0.0)
+        };
+        for (poll, moving_tol) in [(50i64, 1.5f32), (300, 3.0)] {
+            let mut p = Progress::new(Some(0.0), poll as f32);
+            let mut read = (0.0f32, 0i64);
+            let (mut moving, mut stopped) = (0.0f32, 0.0f32);
+            let steady = |t: i64| (2 * poll..1000).contains(&t) || (poll == 50 && (1600..2500).contains(&t));
+            let still = |t: i64| poll == 50 && (1150..1500).contains(&t);
+            for t in 0..2500i64 {
+                if t % poll == 0 {
+                    let v = (truth(t - t % 10) * 10.0).round() / 10.0;
+                    if v != read.0 {
+                        read = (v, t);
+                    }
+                }
+                if t % 10 != 0 {
+                    continue;
+                }
+                p.update(read.0, read.1);
+                for f in [t, t - 400] {
+                    let e = (p.at(f) - truth(f)).abs();
+                    if steady(f) && (f == t || poll == 50) {
+                        moving = moving.max(e);
+                    } else if still(f) {
+                        stopped = stopped.max(e);
+                    }
+                }
+            }
+            assert!(moving < moving_tol, "轮询 {poll} ms：运动中误差 {moving:.2} mm");
+            if poll == 50 {
+                assert!(stopped < 0.2, "停下后还在往前推：误差 {stopped:.2} mm");
+            }
+        }
+    }
+
     #[test]
     fn three_cameras_cover_whole_closed_path() {
         let recipe = builtin().into_iter().find(|r| r.follow.is_some()).unwrap();
-        let mut t = Tracker::new(recipe.clone(), tri_calib(), 0, None).unwrap();
+        let mut t = Tracker::new(recipe.clone(), tri_calib(), 0, false, PlcStart { zero: None, poll_ms: 50.0 }).unwrap();
         let mut s = 0.0;
         while s < t.end_s() {
             for c in 0..3 {

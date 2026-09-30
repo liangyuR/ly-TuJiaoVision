@@ -11,7 +11,7 @@ export default function FramePreview({ cam, status, lastFrame, config }: { cam: 
     setError("");
     cameraApi.softTrigger(cam).catch((e) => setError(String(e)));
   };
-  const canTrigger = config?.acquisition === "triggered" && (config.source === "replay" || (config.source === "mvs" && config.triggerSource === "Software"));
+  const canTrigger = config?.source === "replay" || (config?.acquisition === "triggered" && config.source === "mvs" && config.triggerSource === "Software");
 
   return (
     <div className="panel">
@@ -25,7 +25,7 @@ export default function FramePreview({ cam, status, lastFrame, config }: { cam: 
           </span>
         )}
         <span className="spacer" />
-        <button className="btn" onClick={soft} disabled={!canTrigger} title="触发采集的回放相机，或触发源为 Software 的海康相机">
+        <button className="btn" onClick={soft} disabled={!canTrigger} title="回放相机，或触发源为 Software 的触发采集海康相机">
           <Zap size={15} />
           {config?.source === "replay" ? "下一张" : "软触发一次"}
         </button>

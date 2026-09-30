@@ -1,5 +1,6 @@
-//! 帧录制：一件工件的整帧图像写成 `cam{通道}_{序号}.pgm`，外加 `part.json`（配方快照、逐帧元数据、结果），
-//! 目录可以直接给回放相机用。写盘在后台线程，队列满了丢帧计数，不拖慢检测节拍。
+//! 帧录制：一件工件的整帧图像按相机编号写成 `{编号}_{序号}.pgm`（编号 cam2 的相机回放时选通道 2），
+//! 外加 `part.json`（配方快照、逐帧元数据、结果），目录可以直接给回放相机用。
+//! 写盘在后台线程，队列满了丢帧计数，不拖慢检测节拍。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,6 +24,8 @@ const QUEUE: usize = 48;
 #[serde(rename_all = "camelCase")]
 struct FrameMeta {
     cam: u8,
+    /// 相机编号
+    camera: String,
     seq: u32,
     file: String,
     ts: i64,
@@ -43,6 +46,8 @@ pub struct Recording {
     sn: u32,
     recipe: Arc<Recipe>,
     mode: RecordMode,
+    /// 相机组序号 → 相机编号（本件开工时）
+    cameras: Vec<(u8, String)>,
     seq: Vec<u32>,
     frames: Vec<FrameMeta>,
     dropped: u32,
@@ -67,12 +72,23 @@ impl Recorder {
         &self.root
     }
 
-    pub fn begin(&self, mode: RecordMode, sn: u32, recipe: Arc<Recipe>) -> Option<Recording> {
+    pub fn begin(&self, mode: RecordMode, sn: u32, recipe: Arc<Recipe>, cameras: Vec<(u8, String)>) -> Option<Recording> {
         if mode == RecordMode::Off {
             return None;
         }
         let name = format!("{}_SN{sn}", Local::now().format("%Y%m%d_%H%M%S_%3f"));
-        Some(Recording { started: ly_plc::now_ms(), dir: self.root.join("_pending").join(&name), name, sn, recipe, mode, seq: Vec::new(), frames: Vec::new(), dropped: 0 })
+        Some(Recording {
+            started: ly_plc::now_ms(),
+            dir: self.root.join("_pending").join(&name),
+            name,
+            sn,
+            recipe,
+            mode,
+            cameras,
+            seq: Vec::new(),
+            frames: Vec::new(),
+            dropped: 0,
+        })
     }
 
     pub fn frame(&self, rec: &mut Recording, f: &Frame) {
@@ -82,7 +98,8 @@ impl Recorder {
             rec.seq.resize(cam + 1, 0);
         }
         rec.seq[cam] += 1;
-        let file = format!("cam{}_{:06}.pgm", cam + 1, rec.seq[cam]);
+        let camera = rec.cameras.iter().find(|(c, _)| *c == f.cam).map_or_else(|| format!("cam{}", cam + 1), |(_, id)| id.clone());
+        let file = format!("{camera}_{:06}.pgm", rec.seq[cam]);
         if self.queued.load(Ordering::Relaxed) >= QUEUE {
             rec.dropped += 1;
             return;
@@ -93,7 +110,7 @@ impl Recorder {
             rec.dropped += 1;
             return;
         }
-        rec.frames.push(FrameMeta { cam: f.cam, seq: rec.seq[cam], file, ts: f.ts, frame_counter: f.frame_counter, trigger_counter: f.trigger_counter });
+        rec.frames.push(FrameMeta { cam: f.cam, camera, seq: rec.seq[cam], file, ts: f.ts, frame_counter: f.frame_counter, trigger_counter: f.trigger_counter });
     }
 
     pub fn finish(&self, rec: Recording, verdict: Verdict, reason: &str, keep: u32, max_bytes: u64) {
@@ -116,6 +133,8 @@ impl Recorder {
 }
 
 fn writer(root: PathBuf, rx: Receiver<Msg>, queued: Arc<AtomicUsize>) {
+    // 上次程序中途退出留下的半件录制：没有结果，也不计入保留件数与总大小
+    let _ = std::fs::remove_dir_all(root.join("_pending"));
     while let Ok(msg) = rx.recv() {
         match msg {
             Msg::Frame { path, image } => {

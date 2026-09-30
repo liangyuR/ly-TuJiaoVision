@@ -12,11 +12,12 @@ export default function RecipePage() {
   const [cameras, setCameras] = useState<{ id: string; name: string }[]>([]);
   const [error, setError] = useState("");
 
-  const reload = async (select?: string) => {
+  /** select：要打开的配方；不给时留在当前这个，null 表示刚删掉当前配方、打开列表里的第一个。 */
+  const reload = async (select?: string | null) => {
     const r = await recipeApi.list();
     setList(r.recipes);
     setErrors(r.errors);
-    const id = select ?? selected ?? r.recipes[0]?.id ?? null;
+    const id = (select === undefined ? selected : select) ?? r.recipes[0]?.id ?? null;
     if (id) open(id);
   };
 
@@ -58,13 +59,13 @@ export default function RecipePage() {
       await recipeApi.remove(selected);
       setSelected(null);
       setEditing(null);
-      reload();
+      reload(null);
     } catch (e) {
       setError(String(e));
     }
   };
 
-  const saved = useLayout(editing?.originalId, list.find((r) => r.id === editing?.originalId)?.version);
+  const saved = useLayout(editing?.originalId, list.find((r) => r.id === editing?.originalId)?.hash);
 
   return (
     <div className="rcp-page">

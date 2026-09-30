@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { ArrowLeft, Scale } from "lucide-react";
 import { computeVis, TrajectoryMap, UnrolledCurve, type Measured, type PartView, type Recipe } from "../features/cycle";
-import { formatTime, historyApi, verdictClass, verdictLabel, type PartDetail, type RejudgeResult } from "../features/history";
+import { formatTime, historyApi, triggerModeLabel, verdictClass, verdictLabel, type PartDetail, type RejudgeResult } from "../features/history";
 
 const frameStatus: Record<string, [string, string]> = {
   waiting: ["未到达", "c-err"],
@@ -59,9 +59,11 @@ export default function HistoryDetailPage() {
         ]
       : [];
     const missing = () => ({ status: "missing" as const, cam: 0, s: null, arrivedMs: null, frameCounter: null, triggerCounter: null, counterJump: false, score: null, points: 0, gapPoints: 0, ms: null });
+    const frames = detail.frames.length || layout.mode === "follow" ? detail.frames : layout.shots.map(missing);
     const part: PartView = {
       sn: detail.summary.sn,
       recipeId: layout.id,
+      recipeHash: layout.hash,
       mode: layout.mode,
       n: layout.shots.length,
       received: detail.summary.framesReceived,
@@ -69,7 +71,8 @@ export default function HistoryDetailPage() {
       queue: 0,
       filled: idx.length,
       total: layout.points.k.length,
-      frames: detail.frames.length || layout.mode === "follow" ? detail.frames : layout.shots.map(missing),
+      frames,
+      measuredFrames: frames.length,
       nozzleS: null,
       endS: null,
       activeCam: null,
@@ -102,7 +105,7 @@ export default function HistoryDetailPage() {
           {formatTime(s.ts)} · {s.recipeId ?? "无配方"}
           {s.recipeVersion != null && ` v${s.recipeVersion}`}
           {s.recipeHash && ` #${s.recipeHash.slice(0, 6)}`}
-          {s.triggerMode && ` · ${s.triggerMode === "stop" ? "停稳拍" : s.triggerMode === "follow" ? "随动" : "飞拍"}`}
+          {s.triggerMode && ` · ${triggerModeLabel(s.triggerMode)}`}
           {s.triggerMode === "follow"
             ? ` · 收到 ${s.framesReceived} 帧 · 测 ${detail.frames.length} 帧`
             : s.framesExpected > 0 && ` · 帧 ${s.framesReceived}/${s.framesExpected}`}
@@ -211,7 +214,7 @@ export default function HistoryDetailPage() {
                   return (
                     <tr key={k}>
                       <td className="mono">k{k}</td>
-                      <td className="mono">#{(f.cam ?? 0) + 1}{f.s != null ? ` · ${f.s.toFixed(1)}` : ""}</td>
+                      <td className="mono">{f.camera || `#${(f.cam ?? 0) + 1}`}{f.s != null ? ` · ${f.s.toFixed(1)}` : ""}</td>
                       <td className="mono">{f.arrivedMs != null ? `${f.arrivedMs} ms` : "—"}</td>
                       <td className="mono">{f.arrivedMs != null && prev != null ? `${f.arrivedMs - prev} ms` : "—"}</td>
                       <td className={`mono${f.counterJump ? " c-err" : ""}`}>{f.frameCounter ?? "—"} / {f.triggerCounter ?? "—"}{f.counterJump ? " 跳号" : ""}</td>

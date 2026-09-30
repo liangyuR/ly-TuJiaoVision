@@ -112,6 +112,7 @@ impl Judgement {
 const MAX_INVALID_LEN: f32 = 2.0;
 
 /// 一段里某个量（位置或胶宽）的统计：极值、有没有超绝对限、最长连续超差。
+#[derive(Default)]
 struct Stat {
     min: Option<f32>,
     max: Option<f32>,
@@ -119,25 +120,39 @@ struct Stat {
     excursion_len: f32,
 }
 
-fn stat(runs: &[Vec<f32>], p: &JudgeParams, window: usize, sp: f32) -> Stat {
-    let mut st = Stat { min: None, max: None, absolute: false, excursion_len: 0.0 };
-    let mut max_run = 0usize;
-    for run in runs {
-        let d = median_filter(run, window);
-        let mut out = 0usize;
-        for &v in &d {
-            st.min = Some(st.min.map_or(v, |m| m.min(v)));
-            st.max = Some(st.max.map_or(v, |m| m.max(v)));
-            st.absolute |= v < p.abs_min || v > p.abs_max;
-            if v < p.lower() || v > p.upper() {
-                out += 1;
-                max_run = max_run.max(out);
-            } else {
-                out = 0;
-            }
+/// 沿整条胶路（闭合时首尾相接）按连续测到的点做中值滤波：滤波与连续超差都不在分段边界处断开，
+/// 否则折线导入的胶路每条边一段，几毫米长的超差会被切成好几截、短段上的单点噪声也滤不掉。
+fn filtered(table: &[PointState], closed: bool, window: usize, value: impl Fn(&PointState) -> Option<f32>) -> Vec<Option<f32>> {
+    let mut out = vec![None; table.len()];
+    for run in runs_where(table, closed, |_, p| value(p).is_some()) {
+        let v: Vec<f32> = run.iter().map(|&j| value(&table[j]).unwrap()).collect();
+        for (&j, f) in run.iter().zip(median_filter(&v, window)) {
+            out[j] = Some(f);
         }
     }
-    st.excursion_len = max_run as f32 * sp;
+    out
+}
+
+/// 各段的统计。超差按整条胶路上的连续区间算长度，区间碰到的每一段都记它的全长（各点按所在段的公差判）。
+fn stats(recipe: &Recipe, table: &[PointState], values: &[Option<f32>], limits: impl Fn(usize) -> Option<JudgeParams>) -> Vec<Stat> {
+    let seg = |j: usize| recipe.points.seg[j] as usize;
+    let mut st: Vec<Stat> = recipe.segments.iter().map(|_| Stat::default()).collect();
+    let params: Vec<Option<JudgeParams>> = (0..recipe.segments.len()).map(&limits).collect();
+    for (j, v) in values.iter().enumerate() {
+        let (Some(v), Some(p)) = (*v, &params[seg(j)]) else { continue };
+        let s = &mut st[seg(j)];
+        s.min = Some(s.min.map_or(v, |m| m.min(v)));
+        s.max = Some(s.max.map_or(v, |m| m.max(v)));
+        s.absolute |= v < p.abs_min || v > p.abs_max;
+    }
+    let out = |j: usize| values[j].zip(params[seg(j)].as_ref()).is_some_and(|(v, p)| v < p.lower() || v > p.upper());
+    for run in runs_where(table, recipe.closed, |j, _| out(j)) {
+        let len = run.len() as f32 * recipe.spacing;
+        for &j in &run {
+            let s = &mut st[seg(j)];
+            s.excursion_len = s.excursion_len.max(len);
+        }
+    }
     st
 }
 
@@ -165,15 +180,22 @@ pub fn judge(recipe: &Recipe, table: &[PointState]) -> Judgement {
         }
     }
 
+    let d = filtered(table, closed, recipe.filter_window, |p| match p {
+        PointState::Measured { d, .. } => Some(*d),
+        _ => None,
+    });
+    let w = filtered(table, closed, recipe.filter_window, |p| match p {
+        PointState::Measured { w, .. } if w.is_finite() => Some(*w),
+        _ => None,
+    });
+    let pos_stats = stats(recipe, table, &d, |gi| Some(recipe.segments[gi].params.clone()));
+    let width_stats = stats(recipe, table, &w, |gi| recipe.segments[gi].width.clone());
     let mut segments: Vec<SegmentResult> = recipe
         .segments
         .iter()
-        .enumerate()
-        .map(|(gi, seg)| {
-            let idx = (0..n).filter(|&j| recipe.points.seg[j] as usize == gi);
-            let (d_runs, w_runs) = linear_runs(idx, table);
-            let pos = stat(&d_runs, &seg.params, recipe.filter_window, sp);
-            let width = seg.width.as_ref().map(|p| stat(&w_runs, p, recipe.filter_window, sp));
+        .zip(pos_stats.into_iter().zip(width_stats))
+        .map(|(seg, (pos, width))| {
+            let width = seg.width.as_ref().map(|_| width);
             let mut verdict = if pos.absolute {
                 Verdict::NgAbsolute
             } else if pos.excursion_len > seg.params.max_excursion_len {
@@ -297,36 +319,6 @@ fn runs_where(table: &[PointState], closed: bool, pred: impl Fn(usize, &PointSta
         }
     }
     runs
-}
-
-/// 段内连续的已测点（位置、胶宽各一份），缺胶或无效点处断开，供滤波与超差长度统计。
-fn linear_runs(indices: impl Iterator<Item = usize>, table: &[PointState]) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
-    let (mut d_runs, mut w_runs) = (Vec::new(), Vec::new());
-    let (mut d_cur, mut w_cur) = (Vec::new(), Vec::new());
-    for j in indices {
-        if let PointState::Measured { d, w } = table[j] {
-            d_cur.push(d);
-            if w.is_finite() {
-                w_cur.push(w);
-            } else if !w_cur.is_empty() {
-                w_runs.push(std::mem::take(&mut w_cur));
-            }
-        } else {
-            if !d_cur.is_empty() {
-                d_runs.push(std::mem::take(&mut d_cur));
-            }
-            if !w_cur.is_empty() {
-                w_runs.push(std::mem::take(&mut w_cur));
-            }
-        }
-    }
-    if !d_cur.is_empty() {
-        d_runs.push(d_cur);
-    }
-    if !w_cur.is_empty() {
-        w_runs.push(w_cur);
-    }
-    (d_runs, w_runs)
 }
 
 fn median_filter(values: &[f32], window: usize) -> Vec<f32> {

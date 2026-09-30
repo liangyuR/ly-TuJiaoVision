@@ -36,7 +36,9 @@ export default function CameraPage() {
     setError("");
     try {
       const base = configs[configs.length - 1] ?? defaultCameraConfig;
-      const i = await cameraApi.add({ ...base, name: `相机 ${configs.length + 1}`, serial: "", follow: null });
+      let n = configs.length + 1;
+      while (configs.some((c) => c.name === `相机 ${n}`)) n++;
+      const i = await cameraApi.add({ ...base, name: `相机 ${n}`, serial: "", follow: null });
       await reload();
       setCam(i);
     } catch (e) {
@@ -44,7 +46,7 @@ export default function CameraPage() {
     }
   };
   const remove = async () => {
-    if (!config || !window.confirm(`从相机组里移除「${config.name}」？后面相机的序号会前移，配方里的相机序号需要对应调整。`)) return;
+    if (!config || !window.confirm(`从相机组里移除「${config.name}」（${config.id}）？用到它的配方要改用别的相机才能开工，这个编号以后也不会再分给别的相机。`)) return;
     setError("");
     try {
       await cameraApi.remove(cam);
@@ -61,10 +63,10 @@ export default function CameraPage() {
         {configs.map((c, i) => {
           const st = statuses.find((s) => s.cam === i);
           return (
-            <button key={i} className={`tab${i === cam ? " active" : ""}`} onClick={() => setCam(i)}>
+            <button key={c.id} className={`tab${i === cam ? " active" : ""}`} onClick={() => setCam(i)}>
               <i className={st?.ready ? "ok" : ""} />
               {c.name || `相机 ${i + 1}`}
-              <span className="muted mono">#{i + 1}</span>
+              <span className="muted mono">{c.id}</span>
             </button>
           );
         })}
@@ -99,17 +101,18 @@ export default function CameraPage() {
         {status?.droppedFrames ? <span className="chip-static c-warn">节拍丢帧 {status.droppedFrames}</span> : null}
         <span className="muted" style={{ fontSize: 12.5 }}>{status?.message}</span>
       </div>
+      {/* 面板按相机编号挂载：移除前面的相机后序号会变，按序号挂载会留着被移除相机的设置 */}
       <div className="col">
-        {config && <CameraConfigPanel key={cam} cam={cam} initial={config} follow={config.follow} status={status} onSaved={saved} />}
+        {config && <CameraConfigPanel key={config.id} cam={cam} initial={config} follow={config.follow} status={status} onSaved={saved} />}
       </div>
       <div className="col">
-        <FramePreview cam={cam} status={status} lastFrame={lastFrame[cam]} config={config} />
-        {config?.acquisition === "freeRun" && <FollowCalibPanel key={`f${cam}`} cam={cam} config={config} frame={lastFrame[cam]} onSaved={saved} />}
+        <FramePreview key={config?.id} cam={cam} status={status} lastFrame={lastFrame[cam]} config={config} />
+        {config?.acquisition === "freeRun" && <FollowCalibPanel key={`f${config.id}`} cam={cam} config={config} frame={lastFrame[cam]} onSaved={saved} />}
         {config?.acquisition === "triggered" && (
           <>
             <FeasibilityCalc exposure={config.exposureUs} fps={status?.maxFps} />
             <DryRunPanel cam={cam} frameMs={frameMs} />
-            <CalibPanel cam={cam} isSim={config.source === "sim"} />
+            <CalibPanel key={config.id} cam={cam} isSim={config.source === "sim"} />
           </>
         )}
         <div className="panel">

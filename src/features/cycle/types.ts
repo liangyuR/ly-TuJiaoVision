@@ -1,4 +1,3 @@
-import type { CameraStatus } from "../camera/types";
 
 export type Phase = "IDLE" | "VALIDATE" | "ACQUIRE" | "DRAIN" | "JUDGE" | "REPORT" | "RELEASE" | "FAULT";
 export type FrameStatus = "waiting" | "measuring" | "done" | "locateFailed" | "error" | "missing";
@@ -117,6 +116,8 @@ export interface RecipeSummary {
 export interface FrameView {
   status: FrameStatus;
   cam: number;
+  /** 相机编号（旧记录里没有） */
+  camera?: string;
   s: number | null;
   arrivedMs: number | null;
   frameCounter: number | null;
@@ -131,6 +132,8 @@ export interface FrameView {
 export interface PartView {
   sn: number;
   recipeId: string;
+  /** 本件配方快照的哈希 */
+  recipeHash: string;
   mode: InspectMode;
   n: number;
   received: number;
@@ -138,7 +141,9 @@ export interface PartView {
   queue: number;
   filled: number;
   total: number;
+  /** 飞拍各拍照点的帧；随动为空，只给测量帧数 */
   frames: FrameView[];
+  measuredFrames: number;
   nozzleS: number | null;
   endS: number | null;
   activeCam: number | null;
@@ -191,7 +196,6 @@ export interface Snapshot {
   stats: { total: number; ok: number; ng: number; err: number };
   strayFrames: number;
   alarms: string[];
-  cameras: CameraStatus[];
 }
 
 export interface LogLine {

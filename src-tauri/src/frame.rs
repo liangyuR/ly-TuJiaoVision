@@ -1,5 +1,5 @@
-//! 相机帧与整帧像素缓冲池。三路相机连续采集时每帧都新分配 1–5 MB 会让内存抖动，
-//! 缓冲用完（最后一个 Arc 释放）就回到池里给下一帧用。
+//! 相机帧与整帧像素缓冲池。三路海康相机连续采集时每帧都新分配 1–5 MB 会让内存抖动，
+//! 取图回调拷出来的缓冲用完（最后一个 Arc 释放）就回到池里给下一帧用。
 
 use std::sync::{Arc, Mutex, Weak};
 
@@ -78,12 +78,6 @@ impl FramePool {
         buf.extend_from_slice(src);
         FrameImage { width, height, pixels: buf, pool: Some(Arc::downgrade(&self.0)) }
     }
-
-    /// 把现成的图像（模拟合成、回放解码出来的）挂到池上，用完后缓冲回收。
-    pub fn adopt(&self, mut img: FrameImage) -> FrameImage {
-        img.pool = Some(Arc::downgrade(&self.0));
-        img
-    }
 }
 
 /// 一帧图像的元数据。计数器取自相机 Chunk（帧计数、Line0 触发计数），未开启 Chunk 时退化为 SDK 帧号。
@@ -96,6 +90,9 @@ pub struct Frame {
     pub trigger_counter: u64,
     pub lost_packets: u32,
     pub ts: i64,
+    /// 软触发（示教取图、回放"下一张"）出来的帧
+    #[serde(skip)]
+    pub manual: bool,
     /// 整帧 Mono8 像素。需要图像测量或帧录制时才带上。
     #[serde(skip)]
     pub image: Option<Arc<FrameImage>>,

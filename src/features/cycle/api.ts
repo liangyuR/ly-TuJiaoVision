@@ -1,5 +1,5 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { subscribe } from "../plc";
 import type { CycleSettings, ImportedPath, InspectMode, LogLine, Measured, Recipe, RecipeDoc, RecipeSummary, Scenario, SimStatus, Snapshot } from "./types";
 
@@ -26,7 +26,7 @@ export const cycleApi = {
   logs: () => call<LogLine[]>("cycle_logs", undefined, () => []),
   partData: () => call<Measured[]>("cycle_part_data", undefined, () => []),
   recipes: () => call<RecipeSummary[]>("cycle_recipes", undefined, () => []),
-  layout: (recipeId: string) => call<Recipe | null>("cycle_layout", { recipeId }, () => null),
+  layout: (recipeId: string, hash?: string) => call<Recipe | null>("cycle_layout", { recipeId, hash: hash ?? null }, () => null),
   getSettings: () => call<CycleSettings>("cycle_get_settings", undefined, () => structuredClone(defaultSettings)),
   saveSettings: (settings: CycleSettings) => call<void>("cycle_save_settings", { settings }, () => undefined),
   selectRecipe: (recipeId: string) => call<void>("cycle_select_recipe", { recipeId }, () => undefined),
@@ -63,24 +63,30 @@ function notifyRecipes() {
   recipeListeners.forEach((f) => f());
 }
 
-export function useLayout(recipeId: string | null | undefined, version?: number) {
-  const [layout, setLayout] = useState<Recipe | null>(null);
+/**
+ * 配方的运行数据。给了 hash 就要那一版（工件用的配方刚改过，这一件仍按开工时的样子画）。
+ * 换了配方还没取回来时返回 null，不拿上一个配方的数据去对新工件的测量点。
+ */
+export function useLayout(recipeId: string | null | undefined, hash?: string) {
+  const [state, setState] = useState<{ key: string; layout: Recipe | null } | null>(null);
   const [gen, setGen] = useState(0);
+  const key = recipeId ? `${recipeId}:${hash ?? ""}` : "";
   useEffect(() => {
     const f = () => setGen((g) => g + 1);
     recipeListeners.add(f);
     return () => void recipeListeners.delete(f);
   }, []);
   useEffect(() => {
-    if (!recipeId) return setLayout(null);
-    if (!layoutCache.has(recipeId)) layoutCache.set(recipeId, cycleApi.layout(recipeId).catch(() => null));
+    if (!recipeId) return;
+    if (!layoutCache.has(key)) layoutCache.set(key, cycleApi.layout(recipeId, hash).catch(() => null));
     let alive = true;
-    layoutCache.get(recipeId)!.then((l) => alive && setLayout(l));
+    layoutCache.get(key)!.then((layout) => alive && setState({ key, layout }));
     return () => {
       alive = false;
     };
-  }, [recipeId, version, gen]);
-  return layout;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, gen]);
+  return state && state.key === key ? state.layout : null;
 }
 
 export function useRecipes() {
@@ -114,7 +120,7 @@ export function useCycle() {
   }, []);
 
   const sn = snapshot?.part?.sn;
-  const current = sn === undefined ? [] : measured.filter((m) => m.sn === sn);
+  const current = useMemo(() => (sn === undefined ? [] : measured.filter((m) => m.sn === sn)), [measured, sn]);
   return { snapshot, logs, measured: current };
 }
 

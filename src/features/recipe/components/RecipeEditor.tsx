@@ -23,24 +23,41 @@ const paramFields: [keyof JudgeParams, string][] = [
 
 const pointsText = (pts: [number, number][]) => pts.map(([x, y]) => `${x}, ${y}`).join("\n");
 
+const cells = (line: string) => line.split(/[,;\s\t]+/).filter(Boolean);
+
+/** 每行开头连续的数（与导入 CSV 一样，遇到不是数的就停），至少两个才算一个点。 */
 function parseRows(text: string): number[][] {
   return text
     .split(/\r?\n/)
-    .map((l) => l.split(/[,;\s\t]+/).filter(Boolean).map(Number))
-    .filter((v) => v.length >= 2 && v.every(Number.isFinite));
+    .map((l) => {
+      const out: number[] = [];
+      for (const c of cells(l)) {
+        const v = Number(c);
+        if (!Number.isFinite(v)) break;
+        out.push(v);
+      }
+      return out;
+    })
+    .filter((v) => v.length >= 2);
 }
 
 function parseText(text: string): [number, number][] {
   return parseRows(text).map((v) => [v[0], v[1]] as [number, number]);
 }
 
-/** 胶路文本：每行 x, y，第 3 列可选，是从这一点出发那条边的 bulge（圆弧）。 */
-const pathText = (pts: [number, number][], bulges: number[] = []) =>
-  pts.map(([x, y], i) => (bulges[i] ? `${x}, ${y}, ${Number(bulges[i].toFixed(6))}` : `${x}, ${y}`)).join("\n");
+/** 胶路文本：每行 x, y；有圆弧时首行写表头 "x, y, bulge"，第 3 列是从这一点出发那条边的 bulge。 */
+const pathText = (pts: [number, number][], bulges: number[] = []) => {
+  const arcs = bulges.some((b) => b);
+  const rows = pts.map(([x, y], i) => (arcs ? `${x}, ${y}, ${Number((bulges[i] ?? 0).toFixed(6))}` : `${x}, ${y}`));
+  return (arcs ? ["x, y, bulge", ...rows] : rows).join("\n");
+};
 
+/** 与导入 CSV 同一个规矩：第 3 列起默认不认（常见的是高度 z），表头写明 bulge 的那一列才当圆弧参数。 */
 function parsePathText(text: string): { points: [number, number][]; bulges: number[] } {
+  const head = text.split(/\r?\n/).map(cells).find((c) => c.length > 0);
+  const col = head?.some((c) => !Number.isFinite(Number(c))) ? head.findIndex((c) => c.toLowerCase() === "bulge") : -1;
   const rows = parseRows(text);
-  const bulges = rows.map((v) => v[2] ?? 0);
+  const bulges = rows.map((v) => (col >= 0 ? (v[col] ?? 0) : 0));
   return { points: rows.map((v) => [v[0], v[1]] as [number, number]), bulges: bulges.some((b) => b !== 0) ? bulges : [] };
 }
 
@@ -237,7 +254,7 @@ export default function RecipeEditor({ initial, originalId, cameras, onSaved }: 
                 </label>
                 <Num label="拐角倒圆半径（mm）" value={doc.path.radius} onChange={(v) => doc.path.kind === "polyline" && setPath({ ...doc.path, radius: v })} />
                 <p className="muted hint">
-                  DXF 读 ENTITIES 段里的 LWPOLYLINE / POLYLINE（含圆弧与闭合）、CIRCLE，以及首尾相连的 LINE / ARC；有多条路径时取最长的。第 3 列 bulge = tan(圆心角/4)，正值逆时针；首尾重合的点自动当作闭合。
+                  DXF 读 ENTITIES 段里的 LWPOLYLINE / POLYLINE（含圆弧与闭合）、CIRCLE，以及首尾相连的 LINE / ARC；有多条路径时取最长的。CSV 与上面的文本每行 x, y，第 3 列起默认不认；表头写成 x, y, bulge 时第 3 列是圆弧参数 bulge = tan(圆心角/4)，正值逆时针。导入文件时首尾重合的点当作闭合。
                 </p>
               </div>
             </div>
@@ -309,7 +326,7 @@ export default function RecipeEditor({ initial, originalId, cameras, onSaved }: 
           <Section title="随动参数">
             <div className="rcp-cams">
               <span>参与相机</span>
-              {[...cameras, ...f.cameras.filter((id) => !cameras.some((c) => c.id === id)).map((id) => ({ id, name: `${id}（不在相机组里）` }))].map((c) => (
+              {[...cameras, ...f.cameras.filter((id) => !cameras.some((c) => c.id === id)).map((id) => ({ id, name: "不在相机组里" }))].map((c) => (
                 <label key={c.id} className="check">
                   <input
                     type="checkbox"
@@ -323,7 +340,7 @@ export default function RecipeEditor({ initial, originalId, cameras, onSaved }: 
                       })
                     }
                   />
-                  {c.name}
+                  {c.name} · {c.id}
                 </label>
               ))}
             </div>

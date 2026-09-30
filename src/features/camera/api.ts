@@ -58,7 +58,7 @@ export const cameraApi = {
   records: () => call<{ root: string; items: RecordEntry[] }>("records_list", undefined, () => ({ root: "", items: [] })),
 };
 
-/** 相机组状态：每秒刷新，有帧到达时也刷新。 */
+/** 相机组状态每秒刷新；各相机最近一帧攒起来每 250 ms 交一次（缩略图本来也是 250 ms 取一次），页面不必跟着每帧重画。 */
 export function useRigStatus() {
   const [statuses, setStatuses] = useState<CameraStatus[]>([]);
   const [lastFrame, setLastFrame] = useState<Record<number, Frame>>({});
@@ -75,12 +75,20 @@ export function useRigStatus() {
     };
     refresh();
     const timer = setInterval(refresh, 1000);
+    const latest: Record<number, Frame> = {};
+    let fresh = false;
+    const flush = setInterval(() => {
+      if (!fresh) return;
+      fresh = false;
+      setLastFrame({ ...latest });
+    }, 250);
     const off = subscribe<Frame>("camera://frame", (f) => {
-      setLastFrame((prev) => ({ ...prev, [f.cam]: f }));
-      refresh();
+      latest[f.cam] = f;
+      fresh = true;
     });
     return () => {
       clearInterval(timer);
+      clearInterval(flush);
       off();
     };
   }, []);
@@ -94,7 +102,8 @@ export function useRigStatus() {
 export function usePreview(cam: number, frameKey: unknown, intervalMs = 250) {
   const [img, setImg] = useState<PreviewImage | null>(null);
   const lastAt = useRef(0);
-  const pending = useRef(false);
+  /** 正在取哪台相机的缩略图 */
+  const pending = useRef<number | null>(null);
   const current = useRef({ cam, mounted: true });
   current.current.cam = cam;
   useEffect(() => {
@@ -103,17 +112,21 @@ export function usePreview(cam: number, frameKey: unknown, intervalMs = 250) {
       current.current.mounted = false;
     };
   }, []);
+  // 换了相机：先清掉上一台的画面，别的相机的请求也不拦着这一台
+  useEffect(() => setImg(null), [cam]);
   useEffect(() => {
-    if (pending.current) return;
+    if (pending.current === cam) return;
     const t = setTimeout(
       () => {
-        pending.current = true;
+        pending.current = cam;
         lastAt.current = Date.now();
         cameraApi
           .preview(cam)
           .then((p) => p && current.current.mounted && current.current.cam === cam && setImg(p))
           .catch(() => undefined)
-          .finally(() => (pending.current = false));
+          .finally(() => {
+            if (pending.current === cam) pending.current = null;
+          });
       },
       Math.max(0, intervalMs - (Date.now() - lastAt.current)),
     );

@@ -80,7 +80,7 @@ pub struct Segment {
 pub struct PathPoints {
     pub x: Vec<f32>,
     pub y: Vec<f32>,
-    pub seg: Vec<u8>,
+    pub seg: Vec<u16>,
     /// 飞拍：负责该点的拍照点；随动恒为 0（运行时按帧分配）
     pub k: Vec<u8>,
 }
@@ -321,6 +321,15 @@ impl Recipe {
         let [tx, ty] = self.tangent(s);
         [ty, -tx]
     }
+
+    /// normal 乘上它得到指向闭合胶路外侧的法向：绕向与圆角矩形相同（有向面积为正）时 normal 本来就朝外。
+    /// 开放胶路没有内外，取 1。
+    pub fn outward_sign(&self) -> f32 {
+        let (x, y) = (&self.points.x, &self.points.y);
+        let n = x.len();
+        let area: f32 = (0..n).map(|i| x[i] * y[(i + 1) % n] - x[(i + 1) % n] * y[i]).sum();
+        if self.closed && area < 0.0 { -1.0 } else { 1.0 }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -547,12 +556,8 @@ impl RecipeDoc {
                 for p in points {
                     (x0, y0, x1, y1) = (x0.min(p[0]), y0.min(p[1]), x1.max(p[0]), y1.max(p[1]));
                 }
-                // 闭合轮廓常把起点在末尾再写一遍（CAD / CSV 导出都这样）：去掉，不然收尾那条边长度为 0
-                let mut pts = points.as_slice();
-                if closed && pts.len() > 3 && same_point(pts[0], pts[pts.len() - 1]) {
-                    pts = &pts[..pts.len() - 1];
-                }
-                (fillet(pts, closed, radius, bulges, None)?, closed, [x1 - x0, y1 - y0, 0.0])
+                let (pts, bs) = tidy(points, bulges, closed);
+                (fillet(&pts, closed, radius, &bs, None)?, closed, [x1 - x0, y1 - y0, 0.0])
             }
         };
         let limits = |name: &str, kind: SegmentKind| {
@@ -594,12 +599,12 @@ impl RecipeDoc {
             };
             points.x.push(x);
             points.y.push(y);
-            points.seg.push(gi.min(255) as u8);
+            points.seg.push(gi as u16);
             points.k.push(owner as u8);
             j += 1;
         }
-        if segments.len() > 255 {
-            return Err("胶路分段超过 255 段".into());
+        if segments.len() > u16::MAX as usize {
+            return Err("胶路分段太多".into());
         }
         let mut recipe = Recipe {
             id: self.id.clone(),
@@ -751,6 +756,45 @@ fn same_point(a: [f32; 2], b: [f32; 2]) -> bool {
     (a[0] - b[0]).abs() <= 1e-3 && (a[1] - b[1]).abs() <= 1e-3
 }
 
+/// 折线整理：去掉相邻重合点（它后面那条边的 bulge 归到保留下来的点上）；闭合时去掉与起点重合的末点
+/// （CAD / CSV 导出的闭合轮廓常把起点再写一遍）；闭合却只剩两个点（整圆、两段半圆）时把圆弧边从中点剖开。
+fn tidy(points: &[[f32; 2]], bulges: &[f32], closed: bool) -> (Vec<[f32; 2]>, Vec<f32>) {
+    let (mut pts, mut bs): (Vec<[f32; 2]>, Vec<f32>) = (Vec::new(), Vec::new());
+    for (i, &p) in points.iter().enumerate() {
+        let b = bulges.get(i).copied().unwrap_or(0.0);
+        if pts.last().is_some_and(|&q| same_point(q, p)) {
+            if let Some(last) = bs.last_mut() {
+                *last = b;
+            }
+            continue;
+        }
+        pts.push(p);
+        bs.push(b);
+    }
+    if closed && pts.len() > 2 && same_point(pts[0], pts[pts.len() - 1]) {
+        pts.pop();
+        bs.pop();
+    }
+    if !(closed && pts.len() == 2 && bs.iter().any(|b| b.abs() > 1e-6)) {
+        return (pts, bs);
+    }
+    let (mut out, mut out_bs) = (Vec::new(), Vec::new());
+    for e in 0..2 {
+        let (a, b, bulge) = (pts[e], pts[1 - e], bs[e]);
+        out.push(a);
+        if bulge.abs() <= 1e-6 {
+            out_bs.push(0.0);
+            continue;
+        }
+        // 圆弧中点在弦中点的右侧（正 bulge 逆时针，圆心在左），离弦 bulge·弦长/2；两半各转一半的角
+        let half = (bulge.atan() / 2.0).tan();
+        let c = sub(b, a);
+        out.push([(a[0] + b[0]) / 2.0 + c[1] * bulge / 2.0, (a[1] + b[1]) / 2.0 - c[0] * bulge / 2.0]);
+        out_bs.extend([half, half]);
+    }
+    (out, out_bs)
+}
+
 /// 从文件导入的胶路：折线点、各边的 bulge（直边为 0）、是否闭合。
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -763,26 +807,11 @@ pub struct ImportedPath {
 }
 
 impl ImportedPath {
-    /// 去掉相邻重合点；首尾重合视为闭合并去掉末点。
+    /// 首尾重合视为闭合；再按 tidy 整理。
     fn normalized(mut self) -> Result<Self, String> {
-        let (mut pts, mut bs): (Vec<[f32; 2]>, Vec<f32>) = (Vec::new(), Vec::new());
-        for (i, &p) in self.points.iter().enumerate() {
-            let b = self.bulges.get(i).copied().unwrap_or(0.0);
-            if pts.last().is_some_and(|&q| same_point(q, p)) {
-                // 重合点：它后面那条边的 bulge 归到保留下来的点上
-                if let Some(last) = bs.last_mut() {
-                    *last = b;
-                }
-                continue;
-            }
-            pts.push(p);
-            bs.push(b);
-        }
-        if pts.len() > 2 && same_point(pts[0], pts[pts.len() - 1]) {
-            pts.pop();
-            bs.pop();
-            self.closed = true;
-        }
+        let n = self.points.len();
+        self.closed |= n > 2 && same_point(self.points[0], self.points[n - 1]);
+        let (pts, mut bs) = tidy(&self.points, &self.bulges, self.closed);
         if pts.len() < 2 {
             return Err("文件里没读到至少 2 个点".into());
         }
@@ -797,27 +826,23 @@ impl ImportedPath {
         Ok(self)
     }
 
-    /// 近似长度（圆弧按弧长）。
+    /// 长度（圆弧按弧长）。
     fn length(&self) -> f32 {
         let n = self.points.len();
         let edges = if self.closed { n } else { n.saturating_sub(1) };
         (0..edges)
             .map(|e| {
                 let (a, b) = (self.points[e], self.points[(e + 1) % n]);
-                let chord = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
-                let bulge = self.bulges.get(e).copied().unwrap_or(0.0);
-                if bulge.abs() < 1e-6 {
-                    chord
-                } else {
-                    let theta = 4.0 * bulge.atan();
-                    chord / (2.0 * (theta / 2.0).sin().abs()) * theta.abs()
+                match self.bulges.get(e).copied().filter(|b| b.abs() > 1e-6) {
+                    Some(bulge) => bulge_arc(a, b, bulge).len(),
+                    None => Piece::Line { a, b }.len(),
                 }
             })
             .sum()
     }
 }
 
-/// 从 CSV（每行 x, y[, bulge]，可有表头）或 DXF 的文本读出胶路。
+/// 从 CSV（每行 x, y，可有表头）或 DXF 的文本读出胶路。
 /// DXF 读 ENTITIES 段里的 LWPOLYLINE / POLYLINE（含圆弧与闭合标记）、CIRCLE，以及首尾相连的 LINE / ARC；
 /// 有多条路径时取最长的一条。
 pub fn parse_path(text: &str, ext: &str) -> Result<ImportedPath, String> {
@@ -828,13 +853,20 @@ pub fn parse_path(text: &str, ext: &str) -> Result<ImportedPath, String> {
     }
 }
 
+fn csv_cells(line: &str) -> Vec<&str> {
+    line.split([',', ';', '\t', ' ']).map(str::trim).filter(|s| !s.is_empty()).collect()
+}
+
+/// 第 3 列起的数默认不认（常见的是高度 z、序号）；表头里写明 bulge 的那一列才当圆弧参数（tan(圆心角/4)，正值逆时针）。
 fn csv_path(text: &str) -> ImportedPath {
+    let head = text.lines().map(csv_cells).find(|c| !c.is_empty()).filter(|c| c.iter().any(|s| s.parse::<f32>().is_err()));
+    let bulge_col = head.and_then(|c| c.iter().position(|s| s.eq_ignore_ascii_case("bulge")));
     let mut path = ImportedPath::default();
     for l in text.lines() {
-        let v: Vec<f32> = l.split([',', ';', '\t', ' ']).map(str::trim).filter(|s| !s.is_empty()).map_while(|s| s.parse::<f32>().ok()).collect();
+        let v: Vec<f32> = csv_cells(l).into_iter().map_while(|s| s.parse::<f32>().ok()).collect();
         if v.len() >= 2 && v.iter().all(|x| x.is_finite()) {
             path.points.push([v[0], v[1]]);
-            path.bulges.push(v.get(2).copied().unwrap_or(0.0));
+            path.bulges.push(bulge_col.and_then(|c| v.get(c).copied()).unwrap_or(0.0));
         }
     }
     path
@@ -868,9 +900,9 @@ fn dxf_entities(text: &str) -> Vec<Entity<'_>> {
             match value {
                 "SECTION" => in_section_header = true,
                 "ENDSEC" => section = "",
+                _ if section == "ENTITIES" => out.push(Entity { kind: value, pairs: Vec::new() }),
                 _ => {}
             }
-            out.push(Entity { kind: value, pairs: Vec::new() });
             continue;
         }
         if in_section_header && code == 2 {
@@ -884,8 +916,6 @@ fn dxf_entities(text: &str) -> Vec<Entity<'_>> {
             }
         }
     }
-    // 只留 ENTITIES 段里的实体（段名在 SECTION 后面才读到，所以按实体里有没有内容来筛）
-    out.retain(|e| !e.pairs.is_empty() || matches!(e.kind, "SEQEND"));
     out
 }
 
@@ -1018,9 +1048,20 @@ mod import_tests {
 
     #[test]
     fn closed_csv_repeating_first_point() {
-        let p = parse_path("x,y\n0,0\n100,0\n100,50\n0,50\n0,0\n", "csv").unwrap();
+        let p = parse_path("x,y,z\n0,0,5\n100,0,5\n100,50,5\n0,50,5\n0,0,5\n", "csv").unwrap();
         assert!(p.closed);
         assert_eq!(p.points.len(), 4);
+        assert!(p.bulges.is_empty(), "z 列不能当 bulge：{:?}", p.bulges);
+    }
+
+    #[test]
+    fn dxf_circle_builds_full_circle() {
+        let p = parse_path("0\nSECTION\n2\nENTITIES\n0\nCIRCLE\n10\n50\n20\n50\n40\n20\n0\nENDSEC\n0\nEOF\n", "dxf").unwrap();
+        let doc = RecipeDoc { path: PathSpec::Polyline { points: p.points, closed: p.closed, radius: 0.0, bulges: p.bulges }, ..samples()[2].clone() };
+        let r = doc.build().unwrap();
+        let total = r.segments.last().unwrap().s1;
+        assert!((total - 2.0 * std::f32::consts::PI * 20.0).abs() < 0.05, "周长 {total}");
+        assert!((r.pos(total / 4.0)[1] - 50.0).abs() > 15.0, "四分之一处应在圆的上下两端");
     }
 
     #[test]
@@ -1082,11 +1123,23 @@ impl RecipeStore {
             paths.sort();
             for p in paths {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+                let stem = p.file_stem().and_then(|n| n.to_str()).unwrap_or_default().to_string();
                 let parsed = std::fs::read_to_string(&p)
                     .map_err(|e| e.to_string())
                     .and_then(|s| serde_json::from_str::<RecipeDoc>(&s).map_err(|e| e.to_string()))
                     .and_then(|d| d.build().map(|r| (d, Arc::new(r))));
-                match parsed {
+                // 手工复制、改过的文件也要守住保存时的规矩：删除按编号找文件，PLC 按产品代码找配方
+                let checked = parsed.and_then(|(d, r)| {
+                    if !d.id.eq_ignore_ascii_case(&stem) {
+                        return Err(format!("文件名与配方编号 {} 不一致，没有加载", d.id));
+                    }
+                    match list.iter().find(|(o, _): &&(RecipeDoc, Arc<Recipe>)| o.id.eq_ignore_ascii_case(&d.id) || o.product_code == d.product_code) {
+                        Some((o, _)) if o.product_code == d.product_code => Err(format!("产品代码 {} 与配方 {} 重复，没有加载", d.product_code, o.id)),
+                        Some((o, _)) => Err(format!("配方编号与 {} 重复，没有加载", o.id)),
+                        None => Ok((d, r)),
+                    }
+                });
+                match checked {
                     Ok(pair) => list.push(pair),
                     Err(e) => errors.push(format!("{name}：{e}")),
                 }
@@ -1112,14 +1165,18 @@ impl RecipeStore {
         self.inner.read().unwrap().iter().find(|(d, _)| d.id == id).map(|(d, _)| d.clone())
     }
 
-    /// 保存配方。内容变了版本号 +1；产品代码不能和别的配方重复。
+    /// 保存配方。内容变了版本号 +1；编号（不分大小写：Windows 上文件名不分）与产品代码都不能和别的配方重复。
     pub fn save(&self, mut doc: RecipeDoc, original_id: Option<&str>) -> Result<Arc<Recipe>, String> {
         doc.name = doc.name.trim().to_string();
         let built = doc.build()?;
         let mut inner = self.inner.write().unwrap();
         let replacing = original_id.unwrap_or(&doc.id).to_string();
-        if let Some((d, _)) = inner.iter().find(|(d, _)| d.id != replacing && (d.id == doc.id || d.product_code == doc.product_code)) {
-            return Err(if d.id == doc.id { format!("配方编号 {} 已存在", doc.id) } else { format!("产品代码 {} 已被配方 {} 使用", doc.product_code, d.id) });
+        if let Some((d, _)) = inner.iter().find(|(d, _)| d.id != replacing && (d.id.eq_ignore_ascii_case(&doc.id) || d.product_code == doc.product_code)) {
+            return Err(if d.id.eq_ignore_ascii_case(&doc.id) {
+                format!("配方编号 {} 已存在", d.id)
+            } else {
+                format!("产品代码 {} 已被配方 {} 使用", doc.product_code, d.id)
+            });
         }
         let old = inner.iter().find(|(d, _)| d.id == replacing).map(|(d, r)| (d.version, r.hash.clone()));
         doc.version = match old {
@@ -1129,7 +1186,8 @@ impl RecipeStore {
         };
         let recipe = Arc::new(Recipe { version: doc.version, ..built });
         self.write(&doc)?;
-        if replacing != doc.id {
+        // 只改了大小写时新旧是同一个文件，不能删
+        if !replacing.eq_ignore_ascii_case(&doc.id) {
             let _ = std::fs::remove_file(self.file(&replacing));
         }
         inner.retain(|(d, _)| d.id != replacing && d.id != doc.id);

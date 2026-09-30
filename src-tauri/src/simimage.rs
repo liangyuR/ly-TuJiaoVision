@@ -242,8 +242,7 @@ pub fn teach(recipe: &Recipe, dir: &Path) -> Result<VisionAssets, String> {
             normals.push(json!([nx, ny]));
             ids.push(j);
         }
-        let stations = dir.join(format!("k{k}.stations.json"));
-        std::fs::write(&stations, json!({"points": points, "normals": normals, "ids": ids}).to_string()).map_err(|e| e.to_string())?;
+        let stations = crate::vision::save_stations(dir, k, points, normals, ids)?;
         shots.push(ShotAssets { template, anchor: [ax as f64, ay as f64], stations });
     }
     Ok(VisionAssets {

@@ -39,14 +39,6 @@ fn refine(g: &[f32], i: usize) -> f32 {
     }
 }
 
-fn mean(p: &[f32]) -> f32 {
-    if p.is_empty() {
-        0.0
-    } else {
-        p.iter().sum::<f32>() / p.len() as f32
-    }
-}
-
 /// 暗胶条：先下降沿后上升沿。宽度限制与对比度都以样本为单位。
 fn dark_bead(p: &[f32], w_min: f32, w_max: f32) -> Option<Bead> {
     let n = p.len();
@@ -59,17 +51,28 @@ fn dark_bead(p: &[f32], w_min: f32, w_max: f32) -> Option<Bead> {
         (1..n - 1).filter(|&i| g[i] * sign > 0.0 && g[i] * sign >= g[i - 1] * sign && g[i] * sign >= g[i + 1] * sign).collect()
     };
     let (falls, rises) = (extrema(-1.0), extrema(1.0));
+    // 前缀和：每对边缘的内外均值 O(1)，不用每对都重新求和
+    let mut pre = vec![0.0f64; n + 1];
+    for i in 0..n {
+        pre[i + 1] = pre[i] + s[i] as f64;
+    }
+    let sum = |a: usize, b: usize| pre[b] - pre[a];
     let mut best: Option<(f32, Bead)> = None;
     for &f in &falls {
-        for &r in rises.iter().filter(|&&r| r > f) {
+        // 亚像素细化最多各挪半个样本：宽度够得着的上升沿只在这一段里
+        let lo = rises.partition_point(|&r| (r as f32) < f as f32 + w_min - 1.0);
+        for &r in rises[lo..].iter().take_while(|&&r| r as f32 <= f as f32 + w_max + 1.0).filter(|&&r| r > f) {
             let (ef, er) = (refine(&g, f), refine(&g, r));
             let width = er - ef;
             if width < w_min || width > w_max {
                 continue;
             }
             let side = ((width * 0.5).round() as usize).max(2);
-            let inside = mean(&s[f + 1..r.max(f + 2).min(n)]);
-            let outside = mean(&[&s[f.saturating_sub(side)..f], &s[(r + 1).min(n)..(r + 1 + side).min(n)]].concat());
+            let (a, b) = (f + 1, r.max(f + 2).min(n));
+            let inside = (sum(a, b) / (b - a) as f64) as f32;
+            let (l0, r0, r1) = (f.saturating_sub(side), (r + 1).min(n), (r + 1 + side).min(n));
+            let count = (f - l0) + (r1 - r0);
+            let outside = if count == 0 { 0.0 } else { ((sum(l0, f) + sum(r0, r1)) / count as f64) as f32 };
             let contrast = outside - inside;
             let score = (-g[f]).min(g[r]) * contrast.max(0.0).sqrt();
             if best.is_none_or(|(b, _)| score > b) {
@@ -82,11 +85,11 @@ fn dark_bead(p: &[f32], w_min: f32, w_max: f32) -> Option<Bead> {
 
 /// 在剖面里找胶条。w_min / w_max 与返回值都以样本为单位。
 pub fn find_bead(profile: &[f32], polarity: Polarity, w_min: f32, w_max: f32) -> Option<Bead> {
-    let inverted: Vec<f32> = profile.iter().map(|v| 255.0 - v).collect();
+    let inverted = || profile.iter().map(|v| 255.0 - v).collect::<Vec<f32>>();
     match polarity {
         Polarity::Dark => dark_bead(profile, w_min, w_max),
-        Polarity::Light => dark_bead(&inverted, w_min, w_max),
-        Polarity::Any => match (dark_bead(profile, w_min, w_max), dark_bead(&inverted, w_min, w_max)) {
+        Polarity::Light => dark_bead(&inverted(), w_min, w_max),
+        Polarity::Any => match (dark_bead(profile, w_min, w_max), dark_bead(&inverted(), w_min, w_max)) {
             (Some(a), Some(b)) => Some(if a.contrast >= b.contrast { a } else { b }),
             (a, b) => a.or(b),
         },
