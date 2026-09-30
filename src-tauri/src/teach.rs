@@ -123,7 +123,7 @@ pub fn teach_flyshot_status(app: AppHandle, cycle: State<'_, CycleHost>, recipe_
     let recipe = cycle.recipe(&recipe_id).ok_or("配方不存在")?;
     let dir = vision::taught_dir(&app, &recipe.id)?;
     let assets = VisionAssets::load(&dir.join(vision::ASSETS_FILE));
-    let stale = assets.as_ref().is_some_and(|a| a.recipe_hash != recipe.geometry_hash());
+    let stale = assets.as_ref().is_some_and(|a| a.fits(&recipe).is_err());
     let taught = (0..recipe.shot_count())
         .map(|k| !stale && assets.as_ref().and_then(|a| a.shots.get(k)).is_some_and(|s| !s.template.as_os_str().is_empty() && s.template.exists()))
         .collect();
@@ -187,14 +187,15 @@ pub fn teach_flyshot_save(app: AppHandle, cycle: State<'_, CycleHost>, teach: Sh
     let stations = vision::save_stations(&dir, teach.k, points, normals, ids)?;
 
     let file = dir.join(vision::ASSETS_FILE);
-    let geometry = recipe.geometry_hash();
-    let mut assets = VisionAssets::load(&file).filter(|a| a.recipe_hash == geometry).unwrap_or(VisionAssets {
+    let mut assets = VisionAssets::load(&file).filter(|a| a.fits(&recipe).is_ok()).unwrap_or(VisionAssets {
         recipe_id: recipe.id.clone(),
-        recipe_hash: geometry,
+        recipe_hash: recipe.geometry_hash(),
         sim_mm_per_px: None,
         calib: vision::station_calib_path(&app, &recipe.camera)?,
         shots: Vec::new(),
+        camera: String::new(),
     });
+    assets.camera = recipe.camera.clone();
     let empty = ShotAssets { template: PathBuf::new(), anchor: [0.0, 0.0], stations: PathBuf::new() };
     assets.shots.resize(recipe.shot_count(), empty);
     assets.shots[teach.k] = ShotAssets { template, anchor: [x as f64, y as f64], stations };

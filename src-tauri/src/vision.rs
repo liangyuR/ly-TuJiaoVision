@@ -182,6 +182,9 @@ pub struct VisionAssets {
     pub sim_mm_per_px: Option<f64>,
     pub calib: PathBuf,
     pub shots: Vec<ShotAssets>,
+    /// 示教时的飞拍相机编号（旧文件没有，不核对）
+    #[serde(default)]
+    pub camera: String,
 }
 
 impl VisionAssets {
@@ -196,12 +199,33 @@ impl VisionAssets {
         }))
     }
 
+    /// 模板与测量点文件按清单所在目录找：配方改名时整个目录跟着搬。
     pub fn load(path: &Path) -> Option<Self> {
-        std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok())
+        let mut a: Self = std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok())?;
+        let dir = path.parent()?;
+        for s in &mut a.shots {
+            for p in [&mut s.template, &mut s.stations] {
+                if let Some(name) = p.file_name() {
+                    *p = dir.join(name);
+                }
+            }
+        }
+        Some(a)
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        std::fs::write(path, serde_json::to_string_pretty(self).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+        crate::fsio::write_atomic(path, &serde_json::to_string_pretty(self).map_err(|e| e.to_string())?)
+    }
+
+    /// 真实相机的示教资料是否还对得上配方：胶路几何、拍照点没改，飞拍相机没换。
+    pub fn fits(&self, recipe: &Recipe) -> Result<(), String> {
+        if self.recipe_hash != recipe.geometry_hash() {
+            return Err(format!("配方 {} 的胶路或拍照点改过，需要重新示教", recipe.id));
+        }
+        if !self.camera.is_empty() && self.camera != recipe.camera {
+            return Err(format!("配方 {} 换了飞拍相机（示教时是 {}），需要重新示教", recipe.id, self.camera));
+        }
+        Ok(())
     }
 }
 
@@ -335,9 +359,7 @@ pub fn assets_for(app: &AppHandle, recipe: &Recipe) -> Result<Arc<VisionAssets>,
         }
         CameraSource::Mvs | CameraSource::Replay => {
             let mut a = VisionAssets::load(&taught_dir(app, &recipe.id)?.join(ASSETS_FILE)).ok_or_else(|| format!("配方 {} 尚未示教", recipe.id))?;
-            if a.recipe_hash != recipe.geometry_hash() {
-                return Err(format!("配方 {} 的胶路或拍照点改过，需要重新示教", recipe.id));
-            }
+            a.fits(recipe)?;
             a.calib = station_calib_path(app, &recipe.camera)?;
             a
         }

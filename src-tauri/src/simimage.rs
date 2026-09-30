@@ -251,5 +251,6 @@ pub fn teach(recipe: &Recipe, dir: &Path) -> Result<VisionAssets, String> {
         sim_mm_per_px: Some(px),
         calib,
         shots,
+        camera: recipe.camera.clone(),
     })
 }

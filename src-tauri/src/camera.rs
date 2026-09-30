@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{c_uint, c_void};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -235,8 +235,9 @@ struct Shared {
     full_seq: AtomicU64,
     /// 下一帧不管要不要整帧都留一份（标定试测、软触发取图）
     grab: AtomicBool,
-    /// 还没到的软触发帧数：到了就标成手动取的帧
+    /// 还没到的软触发帧数：到了就标成手动取的帧。最后一次软触发 10 s 后还没到的不再等（manual_until，ms）
     manual: AtomicU32,
+    manual_until: AtomicI64,
     last_emit: Mutex<Option<Instant>>,
     disconnected: AtomicBool,
     order: Mutex<Reorder>,
@@ -300,6 +301,9 @@ impl Shared {
         if let Some(img) = &frame.image {
             *self.last_full.lock().unwrap() = Some(img.clone());
             self.full_seq.fetch_add(1, Ordering::SeqCst);
+        }
+        if now_ms() > self.manual_until.load(Ordering::SeqCst) {
+            self.manual.store(0, Ordering::SeqCst);
         }
         frame.manual = self.manual.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
         self.frames.fetch_add(1, Ordering::Relaxed);
@@ -420,6 +424,7 @@ impl CameraSlot {
                 full_seq: AtomicU64::new(0),
                 grab: AtomicBool::new(false),
                 manual: AtomicU32::new(0),
+                manual_until: AtomicI64::new(0),
                 last_emit: Mutex::new(None),
                 disconnected: AtomicBool::new(false),
                 order: Mutex::new(Reorder::default()),
@@ -687,11 +692,18 @@ impl CameraSlot {
         let (warnings, max_fps) = apply(&device, &config);
         device.start(on_image, on_exception, Arc::as_ptr(&self.shared) as *mut c_void)?;
         let mut msg = format!("已连接 {} · {}", device.summary.model, device.summary.serial);
-        let pinned = config.serial.is_empty().then(|| device.summary.serial.clone());
+        let serial = device.summary.serial.clone();
         *self.device.lock().unwrap() = Some(device);
-        if let Some(serial) = pinned {
-            // 序列号留空的相机开到哪台就固定成哪台：重启、增删相机后还是这台，胶嘴标定跟着它
-            self.config.lock().unwrap().serial = serial.clone();
+        // 序列号留空的相机开到哪台就固定成哪台：重启、增删相机后还是这台，胶嘴标定跟着它。打开期间用户另选了序列号就不动
+        let pinned = config.serial.is_empty() && {
+            let mut c = self.config.lock().unwrap();
+            let empty = c.serial.is_empty();
+            if empty {
+                c.serial = serial.clone();
+            }
+            empty
+        };
+        if pinned {
             if let Some(host) = self.shared.rig.app.try_state::<CycleHost>() {
                 let _ = host.camera.save();
             }
@@ -819,6 +831,8 @@ pub struct CameraRig {
     slots: RwLock<Vec<Arc<CameraSlot>>>,
     path: PathBuf,
     next_id: Mutex<u32>,
+    /// 写 cameras.json 一次一个：连上相机固定序列号的后台保存会和界面的保存同时来
+    save_lock: Mutex<()>,
     /// 增删相机（相机组序号重排）一次 +1：按序号记下的相机就作废了
     generation: AtomicU64,
     /// 启动时读配置遇到的问题，节拍启动后写进日志
@@ -855,7 +869,7 @@ impl CameraRig {
             stream_started: Mutex::new(None),
         });
         let slots = file.cameras.into_iter().enumerate().map(|(i, c)| Arc::new(CameraSlot::new(&rig, i as u8, c))).collect();
-        let mut this = Self { rig, slots: RwLock::new(slots), path, next_id: Mutex::new(file.next_id), generation: AtomicU64::new(0), notes };
+        let mut this = Self { rig, slots: RwLock::new(slots), path, next_id: Mutex::new(file.next_id), save_lock: Mutex::new(()), generation: AtomicU64::new(0), notes };
         if assigned {
             if let Err(e) = this.save() {
                 this.notes.push(format!("相机编号没能写回 cameras.json：{e}"));
@@ -883,6 +897,7 @@ impl CameraRig {
     }
 
     fn save(&self) -> Result<(), String> {
+        let _one = self.save_lock.lock().unwrap();
         let cameras = self.configs();
         let file = RigFile { cameras, next_id: *self.next_id.lock().unwrap() };
         crate::fsio::write_atomic(&self.path, &serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?)
@@ -914,6 +929,10 @@ impl CameraRig {
     }
 
     /// 这些相机都就绪；否则返回第一台的原因。
+    pub fn all_ready(&self, cams: &[u8]) -> bool {
+        cams.iter().all(|&c| self.slot(c as usize).is_some_and(|s| s.is_ready()))
+    }
+
     pub fn check_ready_at(&self, cams: &[u8]) -> Result<(), String> {
         for &c in cams {
             let slot = self.slot(c as usize).ok_or("相机组改过了")?;
@@ -1072,10 +1091,15 @@ pub async fn camera_save_config(app: AppHandle, cam: usize, mut config: CameraCo
     config.validate()?;
     // 海康相机要重新打开，检测中改会打断这一件
     check_idle(&app.state::<CycleHost>())?;
-    check_serial(&rig(&app).configs(), cam, &config)?;
     let slot = rig(&app).slot(cam).ok_or("相机不存在")?;
+    let current = slot.config();
     // 编号是配方引用相机的依据，不能改
-    config.id = slot.config().id;
+    config.id = current.id;
+    // 留空的序列号连上后已固定（try_open）；界面里还是打开面板时的空值，不当成改回"第一台空闲的"
+    if config.source == CameraSource::Mvs && current.source == CameraSource::Mvs && config.serial.is_empty() {
+        config.serial = current.serial;
+    }
+    check_serial(&rig(&app).configs(), cam, &config)?;
     slot.set_config(config);
     let saved = rig(&app).save();
     let _ = app.state::<CycleHost>().tx.send(cycle::Input::Refresh);
@@ -1207,6 +1231,7 @@ pub fn camera_soft_trigger(cycle: State<'_, CycleHost>, cam: usize) -> Result<()
         return Err("触发源为 Line0，软触发前先把触发源改为 Software".into());
     }
     slot.shared.grab.store(config.source == CameraSource::Mvs, Ordering::SeqCst);
+    slot.shared.manual_until.store(now_ms() + 10_000, Ordering::SeqCst);
     slot.shared.manual.fetch_add(1, Ordering::SeqCst);
     if slot.trigger(false, None) {
         Ok(())

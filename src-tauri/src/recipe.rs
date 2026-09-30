@@ -269,9 +269,9 @@ impl Recipe {
         if self.closed { n * self.spacing } else { (n - 1.0).max(0.0) * self.spacing }
     }
 
-    /// 只看胶路几何、拍照点与飞拍相机的哈希：示教资料（那台相机拍的模板）跟它走，改判定限值不用重新示教。
+    /// 只看胶路几何与拍照点的哈希：示教资料跟它走，改判定限值不用重新示教。
     pub fn geometry_hash(&self) -> String {
-        let key = serde_json::json!([self.path, self.part, self.spacing, self.shots, self.fov, self.closed, self.camera]);
+        let key = serde_json::json!([self.path, self.part, self.spacing, self.shots, self.fov, self.closed]);
         fnv_hex(&serde_json::to_vec(&key).unwrap_or_default())
     }
 
@@ -1087,14 +1087,12 @@ pub struct RecipeStore {
     dir: PathBuf,
     inner: RwLock<Vec<(RecipeDoc, Arc<Recipe>)>>,
     errors: RwLock<Vec<String>>,
-    /// 没能加载的文件名（小写、不含扩展名），保存时不能覆盖
-    rejected: RwLock<Vec<String>>,
 }
 
 impl RecipeStore {
     pub fn open(dir: PathBuf) -> Result<Self, String> {
         std::fs::create_dir_all(&dir).map_err(|e| format!("创建配方目录失败：{e}"))?;
-        let store = Self { dir, inner: RwLock::new(Vec::new()), errors: RwLock::new(Vec::new()), rejected: RwLock::new(Vec::new()) };
+        let store = Self { dir, inner: RwLock::new(Vec::new()), errors: RwLock::new(Vec::new()) };
         let empty = std::fs::read_dir(&store.dir).map_err(|e| e.to_string())?.flatten().all(|e| e.path().extension().is_none_or(|x| x != "json"));
         if empty {
             for doc in samples() {
@@ -1110,16 +1108,13 @@ impl RecipeStore {
     }
 
     fn write(&self, doc: &RecipeDoc) -> Result<(), String> {
-        let tmp = self.dir.join(format!("{}.json.tmp", doc.id));
-        std::fs::write(&tmp, serde_json::to_string_pretty(doc).map_err(|e| e.to_string())?).map_err(|e| format!("写配方失败：{e}"))?;
-        std::fs::rename(&tmp, self.file(&doc.id)).map_err(|e| format!("写配方失败：{e}"))
+        crate::fsio::write_atomic(&self.file(&doc.id), &serde_json::to_string_pretty(doc).map_err(|e| e.to_string())?)
     }
 
     /// 重读目录。坏文件跳过并记下原因，不影响其他配方。
     pub fn reload(&self) {
         let mut list = Vec::new();
         let mut errors = Vec::new();
-        let mut rejected = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&self.dir) {
             let mut paths: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")).collect();
             paths.sort();
@@ -1143,16 +1138,12 @@ impl RecipeStore {
                 });
                 match checked {
                     Ok(pair) => list.push(pair),
-                    Err(e) => {
-                        errors.push(format!("{name}：{e}"));
-                        rejected.push(stem.to_ascii_lowercase());
-                    }
+                    Err(e) => errors.push(format!("{name}：{e}")),
                 }
             }
         }
         *self.inner.write().unwrap() = list;
         *self.errors.write().unwrap() = errors;
-        *self.rejected.write().unwrap() = rejected;
     }
 
     pub fn list(&self) -> Vec<Arc<Recipe>> {
@@ -1184,8 +1175,10 @@ impl RecipeStore {
                 format!("产品代码 {} 已被配方 {} 使用", doc.product_code, d.id)
             });
         }
-        if self.rejected.read().unwrap().contains(&doc.id.to_ascii_lowercase()) {
-            return Err(format!("配方目录里的 {}.json 没能加载（见配方页的提示），先修好或移走那个文件再用这个编号", doc.id));
+        // 目录里已有这个文件却不是正在保存的这个配方：启动时没能加载，或是之后手工放进来的，不能覆盖
+        let ours = inner.iter().any(|(d, _)| d.id == replacing && d.id.eq_ignore_ascii_case(&doc.id));
+        if !ours && self.file(&doc.id).exists() {
+            return Err(format!("配方目录里已有 {}.json 但没有加载（见配方页的提示）：移走它，或修好后重启程序", doc.id));
         }
         let old = inner.iter().find(|(d, _)| d.id == replacing).map(|(d, r)| (d.version, r.hash.clone()));
         doc.version = match old {

@@ -22,7 +22,8 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, String> 
     let why = match std::fs::read(path) {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => e.to_string(),
-        Ok(bytes) => match serde_json::from_slice(&bytes) {
+        // 记事本、PowerShell 5 存的 UTF-8 带 BOM
+        Ok(bytes) => match serde_json::from_slice(bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes)) {
             Ok(v) => return Ok(Some(v)),
             Err(e) => e.to_string(),
         },

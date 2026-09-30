@@ -6,7 +6,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
 use crate::camera::Acquisition;
-use crate::cycle::{CycleHost, Input, Phase, RecipeSummary};
+use crate::cycle::{CycleHost, Input, RecipeSummary};
 use crate::recipe::{self, default_follow_spec, ImportedPath, InspectMode, Recipe, RecipeDoc};
 use crate::settings::CycleSettings;
 use crate::vision::{self, VisionHost};
@@ -59,6 +59,9 @@ pub fn recipe_template(cycle: State<'_, CycleHost>, mode: InspectMode) -> Recipe
 
 #[tauri::command]
 pub fn recipe_save(app: AppHandle, cycle: State<'_, CycleHost>, doc: RecipeDoc, original_id: Option<String>) -> Result<RecipeSummary, String> {
+    if original_id.as_deref().is_some_and(|o| o != doc.id && cycle.recipe_in_use(o)) {
+        return Err("该配方正在检测中，工件结束后再改编号".into());
+    }
     let saved: Arc<Recipe> = cycle.recipes.save(doc, original_id.as_deref())?;
     if let Some(old) = original_id.filter(|o| *o != saved.id) {
         // 示教资料按配方编号存，跟着改名
@@ -84,10 +87,10 @@ pub fn recipe_save(app: AppHandle, cycle: State<'_, CycleHost>, doc: RecipeDoc, 
 
 #[tauri::command]
 pub fn recipe_delete(app: AppHandle, cycle: State<'_, CycleHost>, id: String) -> Result<(), String> {
-    let settings = cycle.settings();
-    if settings.manual_recipe_id.as_deref() == Some(id.as_str()) && !matches!(cycle.phase(), Phase::Idle | Phase::Fault) {
+    if cycle.recipe_in_use(&id) {
         return Err("该配方正在检测中，工件结束后再删".into());
     }
+    let settings = cycle.settings();
     cycle.recipes.delete(&id)?;
     if let Ok(dir) = vision::taught_dir(&app, &id) {
         let _ = std::fs::remove_dir_all(dir);

@@ -39,6 +39,12 @@ export default function CameraConfigPanel({ cam, initial, follow, status, onSave
     if (config.source === "replay") cameraApi.records().then((r) => setRecords(r.items));
   }, [config.source]);
 
+  // 序列号留空的相机连上后后台已固定成那台
+  const connected = status?.device?.serial;
+  useEffect(() => {
+    if (connected) setConfig((c) => (c.source === "mvs" && !c.serial ? { ...c, serial: connected } : c));
+  }, [connected]);
+
   const set = <K extends keyof CameraConfig>(key: K, value: CameraConfig[K]) => setConfig({ ...config, [key]: value });
   const num = (key: "triggerDelayUs" | "debouncerUs" | "exposureUs" | "gainDb" | "fps" | "replayChannel", step = 1) => (
     <input id={`cam-${key}`} className="input mono" type="number" step={step} value={config[key]} onChange={(e) => set(key, Number(e.target.value))} />

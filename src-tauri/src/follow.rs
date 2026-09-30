@@ -147,6 +147,8 @@ struct Progress {
 
 /// 进度历史留这么久（ms）：处理得最晚的帧也在里面。
 const HISTORY_MS: i64 = 3000;
+/// 开走前进度比零点小这么多（mm）才算 PLC 清零了。
+const CLEAR_DROP_MM: f32 = 1.0;
 
 impl Progress {
     fn new(zero: Option<f32>, poll_ms: f32) -> Self {
@@ -158,8 +160,8 @@ impl Progress {
             return;
         }
         let zero = *self.zero.get_or_insert(raw);
-        // 还没走就比零点小：PLC 布防后才清零，零点回到 0；走起来以后进度不会往回走，变小是 PLC 收尾清零或抖动，不理
-        if raw < zero - 1e-3 && self.samples.len() <= 1 {
+        // 还没走就明显比零点小：PLC 布防后才清零，零点回到 0。差一两个计数是抖动；走起来以后变小是 PLC 收尾清零，都不理
+        if raw < zero - CLEAR_DROP_MM && self.samples.len() <= 1 {
             self.zero = Some(0.0);
             self.samples.clear();
         }
