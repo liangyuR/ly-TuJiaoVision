@@ -8,7 +8,7 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::time::{sleep, Instant};
 
-use crate::camera::{Acquisition, CameraSource, SimRender, SimSource};
+use crate::camera::{CameraSource, SimRender, SimSource};
 use crate::cycle::CycleHost;
 use crate::inspection::{read_tag_u32, tag, tag_is_on, write_tag};
 use crate::measure::Engine;
@@ -339,26 +339,11 @@ pub fn sim_start(
         return Err("PLC 模拟器未连接".into());
     }
     let recipe = cycle.recipe(&recipe_id).ok_or("配方不存在")?;
-    for c in cycle.camera.resolve(&recipe.cameras())? {
-        let slot = cycle.camera.slot(c as usize).ok_or("相机不存在")?;
-        let cam = slot.config();
-        match recipe.mode {
-            InspectMode::FlyShot => {
-                if cam.acquisition != Acquisition::Triggered {
-                    return Err(format!("{} 是连续采集，飞拍配方要用触发采集", cam.name));
-                }
-                if cam.source == CameraSource::Mvs && cam.trigger_source != "Software" {
-                    return Err("相机触发源为 Line0，模拟节拍发不出硬触发；改为 Software 或切换到模拟相机".into());
-                }
-            }
-            InspectMode::Follow => {
-                if cam.acquisition != Acquisition::FreeRun {
-                    return Err(format!("{} 是触发采集，随动配方要用连续采集", cam.name));
-                }
-                if cam.follow.is_none() {
-                    return Err(format!("{} 还没做随动标定", cam.name));
-                }
-            }
+    // 采集方式、随动标定、图像测量与开工时同一套检查；模拟节拍还要能发出触发
+    for c in crate::cycle::usable_cams(&cycle, &recipe)? {
+        let cam = cycle.camera.slot(c as usize).ok_or("相机不存在")?.config();
+        if recipe.mode == InspectMode::FlyShot && cam.source == CameraSource::Mvs && cam.trigger_source != "Software" {
+            return Err("相机触发源为 Line0，模拟节拍发不出硬触发；改为 Software 或切换到模拟相机".into());
         }
     }
     if cycle.sim.running.swap(true, Ordering::SeqCst) {

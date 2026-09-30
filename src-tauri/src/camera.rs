@@ -4,11 +4,10 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{c_uint, c_void};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
-use chrono::Local;
 use ly_plc::now_ms;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -236,8 +235,8 @@ struct Shared {
     full_seq: AtomicU64,
     /// 下一帧不管要不要整帧都留一份（标定试测、软触发取图）
     grab: AtomicBool,
-    /// 这个时刻（ms）之前到的帧是软触发出来的，空闲时不算游离帧
-    manual_until: AtomicI64,
+    /// 还没到的软触发帧数：到了就标成手动取的帧
+    manual: AtomicU32,
     last_emit: Mutex<Option<Instant>>,
     disconnected: AtomicBool,
     order: Mutex<Reorder>,
@@ -253,8 +252,11 @@ impl Shared {
         !self.free_run.load(Ordering::Relaxed) || self.rig.streaming.load(Ordering::Relaxed)
     }
 
-    /// 缩略图最多每 100 ms 做一张：前端 250 ms 才取一次，每帧都降采样是白费。
+    /// 连续采集时缩略图最多每 100 ms 做一张（前端 250 ms 才取一次）；触发采集的帧少，每帧都做，示教裁模板用的就是显示的那帧。
     fn preview_due(&self) -> bool {
+        if !self.free_run.load(Ordering::Relaxed) {
+            return true;
+        }
         let now = Instant::now();
         let mut at = self.preview_at.lock().unwrap();
         if at.is_some_and(|t| now.duration_since(t) < Duration::from_millis(100)) {
@@ -299,7 +301,7 @@ impl Shared {
             *self.last_full.lock().unwrap() = Some(img.clone());
             self.full_seq.fetch_add(1, Ordering::SeqCst);
         }
-        frame.manual = now_ms() <= self.manual_until.load(Ordering::Relaxed);
+        frame.manual = self.manual.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
         self.frames.fetch_add(1, Ordering::Relaxed);
         self.lost_packets.fetch_add(frame.lost_packets as u64, Ordering::Relaxed);
         let now = Instant::now();
@@ -311,9 +313,9 @@ impl Shared {
             }
         }
         {
-            // 前端只要看到"有帧在来"，每台相机每秒最多通知 10 次
+            // 连续采集时前端只要看到"有帧在来"，每台相机每秒最多通知 10 次
             let mut last = self.last_emit.lock().unwrap();
-            if last.is_none_or(|t| now.duration_since(t) > Duration::from_millis(100)) {
+            if !self.free_run.load(Ordering::Relaxed) || last.is_none_or(|t| now.duration_since(t) > Duration::from_millis(100)) {
                 *last = Some(now);
                 let _ = self.rig.app.emit("camera://frame", &frame);
             }
@@ -417,7 +419,7 @@ impl CameraSlot {
                 last_full: Mutex::new(None),
                 full_seq: AtomicU64::new(0),
                 grab: AtomicBool::new(false),
-                manual_until: AtomicI64::new(0),
+                manual: AtomicU32::new(0),
                 last_emit: Mutex::new(None),
                 disconnected: AtomicBool::new(false),
                 order: Mutex::new(Reorder::default()),
@@ -447,7 +449,6 @@ impl CameraSlot {
     pub fn status(&self) -> CameraStatus {
         let config = self.config();
         let ready = self.is_ready();
-        // 各把锁分别取、不嵌套：回放扫描目录、打开相机时持有的锁顺序各不相同
         let (state_message, warnings, max_fps) = {
             let s = self.state.lock().unwrap();
             (s.message.clone(), s.warnings.clone(), s.max_fps)
@@ -518,12 +519,13 @@ impl CameraSlot {
         (self.frame_seq.fetch_add(1, Ordering::SeqCst) + 1, self.trigger_seq.fetch_add(1, Ordering::SeqCst) + 1)
     }
 
-    /// 下一张回放图。连续采集按录制时刻回放时放完为止（下次布防再从头）；其余情况到末尾后从头再来。
+    /// 下一张回放图。布防中连续采集按录制时刻回放时放完为止；手动一张张看、触发采集时到末尾后从头再来。
     fn next_replay(&self) -> Option<PathBuf> {
         let free_run = self.config().acquisition == Acquisition::FreeRun;
+        let streaming = self.shared.rig.streaming.load(Ordering::SeqCst);
         let mut guard = self.replay.lock().unwrap();
         let r = guard.as_mut()?;
-        let once = free_run && r.times.is_some();
+        let once = free_run && streaming && r.times.is_some();
         if once && r.next >= r.files.len() {
             return None;
         }
@@ -550,8 +552,8 @@ impl CameraSlot {
         let dir = config.replay_dir.trim().to_string();
         let path = std::path::Path::new(&dir);
         let scanned = replay::scan(path, config.replay_channel).and_then(|files| {
-            // 先解一张：格式解不开（或文件坏了）就不报就绪
-            replay::load(&files[0])?;
+            // 先读一张的文件头：格式解不开（或文件坏了）就不报就绪
+            replay::probe(&files[0])?;
             let times = replay::timeline(path, &files);
             Ok((files, times))
         });
@@ -661,7 +663,7 @@ impl CameraSlot {
         self.shared.set_preview(&img);
         let (frame_counter, trigger_counter) = self.next_counters();
         self.shared.order.lock().unwrap().next = frame_counter + 1;
-        let image = (self.shared.capture() | self.shared.grab.swap(false, Ordering::SeqCst)).then(|| Arc::new(img));
+        let image = self.shared.capture().then(|| Arc::new(img));
         Some(Frame { cam: self.shared.cam, frame_counter, trigger_counter, lost_packets: 0, ts, manual: false, image })
     }
 
@@ -684,8 +686,17 @@ impl CameraSlot {
         let device = mvs::Device::open(&config.serial, &self.claimed_serials())?;
         let (warnings, max_fps) = apply(&device, &config);
         device.start(on_image, on_exception, Arc::as_ptr(&self.shared) as *mut c_void)?;
-        let msg = format!("已连接 {} · {}", device.summary.model, device.summary.serial);
+        let mut msg = format!("已连接 {} · {}", device.summary.model, device.summary.serial);
+        let pinned = config.serial.is_empty().then(|| device.summary.serial.clone());
         *self.device.lock().unwrap() = Some(device);
+        if let Some(serial) = pinned {
+            // 序列号留空的相机开到哪台就固定成哪台：重启、增删相机后还是这台，胶嘴标定跟着它
+            self.config.lock().unwrap().serial = serial.clone();
+            if let Some(host) = self.shared.rig.app.try_state::<CycleHost>() {
+                let _ = host.camera.save();
+            }
+            msg.push_str(&format!("（序列号已固定为 {serial}）"));
+        }
         let mut state = self.state.lock().unwrap();
         state.warnings = warnings;
         state.max_fps = max_fps;
@@ -808,6 +819,8 @@ pub struct CameraRig {
     slots: RwLock<Vec<Arc<CameraSlot>>>,
     path: PathBuf,
     next_id: Mutex<u32>,
+    /// 增删相机（相机组序号重排）一次 +1：按序号记下的相机就作废了
+    generation: AtomicU64,
     /// 启动时读配置遇到的问题，节拍启动后写进日志
     pub notes: Vec<String>,
 }
@@ -817,15 +830,12 @@ impl CameraRig {
         let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
         let path = dir.join("cameras.json");
         let mut notes = Vec::new();
-        let mut file = match std::fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str::<RigFile>(&text).unwrap_or_else(|e| {
-                // 坏文件（写到一半断电、手改出错）先留一份再重建，里面有各相机的序列号与胶嘴标定
-                let backup = dir.join(format!("cameras.broken-{}.json", Local::now().format("%Y%m%d-%H%M%S")));
-                let kept = std::fs::copy(&path, &backup).map(|_| format!("原文件已备份为 {}，", backup.display())).unwrap_or_default();
-                notes.push(format!("cameras.json 读不了（{e}），{kept}相机组按默认重建"));
+        let mut file: RigFile = match crate::fsio::read_json(&path) {
+            Ok(f) => f.unwrap_or_default(),
+            Err(note) => {
+                notes.push(note);
                 RigFile::default()
-            }),
-            Err(_) => RigFile::default(),
+            }
         };
         if file.cameras.is_empty() {
             // 单相机时代的 camera.json 迁移成相机组的第 1 台
@@ -845,7 +855,7 @@ impl CameraRig {
             stream_started: Mutex::new(None),
         });
         let slots = file.cameras.into_iter().enumerate().map(|(i, c)| Arc::new(CameraSlot::new(&rig, i as u8, c))).collect();
-        let mut this = Self { rig, slots: RwLock::new(slots), path, next_id: Mutex::new(file.next_id), notes };
+        let mut this = Self { rig, slots: RwLock::new(slots), path, next_id: Mutex::new(file.next_id), generation: AtomicU64::new(0), notes };
         if assigned {
             if let Err(e) = this.save() {
                 this.notes.push(format!("相机编号没能写回 cameras.json：{e}"));
@@ -872,26 +882,19 @@ impl CameraRig {
         self.slots().iter().map(|s| s.shared.dropped.load(Ordering::Relaxed)).sum()
     }
 
-    /// 写临时文件再改名：写到一半断电也不会留下半个 cameras.json。
     fn save(&self) -> Result<(), String> {
         let cameras = self.configs();
         let file = RigFile { cameras, next_id: *self.next_id.lock().unwrap() };
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
-        }
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?).map_err(|e| format!("写入配置失败: {e}"))?;
-        std::fs::rename(&tmp, &self.path).map_err(|e| format!("写入配置失败: {e}"))
+        crate::fsio::write_atomic(&self.path, &serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?)
     }
 
-    /// 给新加的相机分配编号，只增不减。
     fn new_id(&self) -> String {
-        let top = self.configs().iter().filter_map(|c| id_number(&c.id)).max().unwrap_or(0);
-        let mut next = self.next_id.lock().unwrap();
-        *next = (*next).max(top + 1);
-        let id = format!("cam{next}");
-        *next += 1;
-        id
+        let configs = self.configs();
+        take_id(&configs, &mut self.next_id.lock().unwrap())
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
     }
 
     pub fn slots(&self) -> Vec<Arc<CameraSlot>> {
@@ -922,11 +925,12 @@ impl CameraRig {
         Ok(())
     }
 
-    /// 这些相机里回放帧录制的，回到第一张。
-    pub fn rewind_recordings(&self, cams: &[u8]) {
+    /// 开工前：回放帧录制的相机回到第一张；没等到的软触发帧不再算数。
+    pub fn begin_part(&self, cams: &[u8]) {
         for &c in cams {
             if let Some(s) = self.slot(c as usize) {
                 s.rewind_recording();
+                s.shared.manual.store(0, Ordering::SeqCst);
             }
         }
     }
@@ -966,6 +970,7 @@ impl CameraRig {
         let slots: Vec<Arc<CameraSlot>> = configs.into_iter().enumerate().map(|(i, c)| Arc::new(CameraSlot::new(&self.rig, i as u8, c))).collect();
         // 旧相机在锁外释放：关海康相机要一会儿，别让别的线程卡在读相机组上
         let old = std::mem::replace(&mut *self.slots.write().unwrap(), slots.clone());
+        self.generation.fetch_add(1, Ordering::SeqCst);
         drop(old);
         for s in &slots {
             supervise(app, Arc::downgrade(s));
@@ -1065,14 +1070,18 @@ pub fn camera_rig_config(cycle: State<'_, CycleHost>) -> Vec<CameraConfig> {
 #[tauri::command]
 pub async fn camera_save_config(app: AppHandle, cam: usize, mut config: CameraConfig) -> Result<Vec<String>, String> {
     config.validate()?;
+    // 海康相机要重新打开，检测中改会打断这一件
+    check_idle(&app.state::<CycleHost>())?;
     check_serial(&rig(&app).configs(), cam, &config)?;
     let slot = rig(&app).slot(cam).ok_or("相机不存在")?;
     // 编号是配方引用相机的依据，不能改
     config.id = slot.config().id;
     slot.set_config(config);
-    rig(&app).save()?;
+    let saved = rig(&app).save();
     let _ = app.state::<CycleHost>().tx.send(cycle::Input::Refresh);
-    tauri::async_runtime::spawn_blocking(move || slot.apply_config()).await.map_err(|e| e.to_string())?
+    let warnings = tauri::async_runtime::spawn_blocking(move || slot.apply_config()).await.map_err(|e| e.to_string())??;
+    saved.map_err(|e| format!("已生效，但没能写回 cameras.json：{e}"))?;
+    Ok(warnings)
 }
 
 /// 同一个序列号不能给两台海康相机（留空表示"第一台空闲的"）。
@@ -1090,34 +1099,44 @@ fn id_number(id: &str) -> Option<u32> {
     id.strip_prefix("cam")?.parse().ok()
 }
 
-/// 没有编号或编号重复的相机补编号：先按位置用 "cam{位置+1}"（旧配方里的相机序号 k 就对应它），被占了就从 next_id 往后取。
-/// next_id 只增不减，删掉的相机编号不会再给新相机。返回是否改过。
+fn take_id(configs: &[CameraConfig], next_id: &mut u32) -> String {
+    let top = configs.iter().filter_map(|c| id_number(&c.id)).max().unwrap_or(0);
+    *next_id = (*next_id).max(top + 1);
+    let id = format!("cam{next_id}");
+    *next_id += 1;
+    id
+}
+
+/// 没有编号或编号重复的相机补编号。旧文件（还没有 next_id）按位置补 "cam{位置+1}"，旧配方里的相机序号 k 就对应它；
+/// 其余从 next_id 取。返回是否改过。
 fn assign_ids(configs: &mut [CameraConfig], next_id: &mut u32) -> bool {
+    let legacy = *next_id == 0;
     let mut changed = false;
     for i in 0..configs.len() {
         let id = configs[i].id.clone();
         if valid_camera_id(&id) && !configs[..i].iter().any(|c| c.id == id) {
             continue;
         }
-        let legacy = legacy_camera_id(i as u8);
-        configs[i].id = if configs.iter().any(|c| c.id == legacy) { String::new() } else { legacy };
+        let pos = legacy_camera_id(i as u8);
+        configs[i].id = if legacy && !configs.iter().any(|c| c.id == pos) { pos } else { String::new() };
         changed = true;
+    }
+    for i in 0..configs.len() {
+        if configs[i].id.is_empty() {
+            configs[i].id = take_id(configs, next_id);
+        }
     }
     let top = configs.iter().filter_map(|c| id_number(&c.id)).max().unwrap_or(0);
     *next_id = (*next_id).max(top + 1);
-    for c in configs.iter_mut().filter(|c| c.id.is_empty()) {
-        c.id = format!("cam{next_id}");
-        *next_id += 1;
-    }
     changed
 }
 
 /// 相机组增删只能在空闲或故障时做：相机序号会重排（编号不变）。
 fn check_idle(cycle: &CycleHost) -> Result<(), String> {
-    if matches!(cycle.phase(), Phase::Idle | Phase::Fault) {
+    if !cycle.busy() && matches!(cycle.phase(), Phase::Idle | Phase::Fault) {
         Ok(())
     } else {
-        Err("检测进行中，工件结束后再调整相机组".into())
+        Err("检测进行中，工件结束后再操作相机".into())
     }
 }
 
@@ -1135,8 +1154,9 @@ pub fn camera_add(app: AppHandle, mut config: CameraConfig) -> Result<usize, Str
     configs.push(config);
     let n = configs.len();
     cycle.camera.rebuild(&app, configs);
-    cycle.camera.save()?;
+    let saved = cycle.camera.save();
     let _ = cycle.tx.send(cycle::Input::Refresh);
+    saved?;
     Ok(n - 1)
 }
 
@@ -1153,9 +1173,9 @@ pub fn camera_remove(app: AppHandle, cam: usize) -> Result<(), String> {
     }
     configs.remove(cam);
     cycle.camera.rebuild(&app, configs);
-    cycle.camera.save()?;
+    let saved = cycle.camera.save();
     let _ = cycle.tx.send(cycle::Input::Refresh);
-    Ok(())
+    saved
 }
 
 #[tauri::command]
@@ -1180,18 +1200,19 @@ pub fn camera_preview(cycle: State<'_, CycleHost>, cam: usize) -> tauri::ipc::Re
 
 #[tauri::command]
 pub fn camera_soft_trigger(cycle: State<'_, CycleHost>, cam: usize) -> Result<(), String> {
+    check_idle(&cycle)?;
     let slot = cycle.camera.slot(cam).ok_or("相机不存在")?;
     let config = slot.config();
     if config.source == CameraSource::Mvs && config.trigger_source != "Software" {
         return Err("触发源为 Line0，软触发前先把触发源改为 Software".into());
     }
-    // 手动取的这一帧留整帧（示教、标定要用），空闲时也不算游离帧
     slot.shared.grab.store(config.source == CameraSource::Mvs, Ordering::SeqCst);
-    slot.shared.manual_until.store(now_ms() + 1000, Ordering::Relaxed);
+    slot.shared.manual.fetch_add(1, Ordering::SeqCst);
     if slot.trigger(false, None) {
         Ok(())
     } else {
         slot.shared.grab.store(false, Ordering::SeqCst);
+        let _ = slot.shared.manual.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
         Err("相机未连接".into())
     }
 }

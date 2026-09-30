@@ -65,11 +65,27 @@ pub fn scan(dir: &Path, channel: u32) -> Result<Vec<PathBuf>, String> {
 
 /// 帧录制目录（有 part.json）里这些帧相对工件开始的时刻（ms），与 files 一一对应；缺了任何一帧就不按时刻回放。
 pub fn timeline(dir: &Path, files: &[PathBuf]) -> Option<Vec<i64>> {
-    let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("part.json")).ok()?).ok()?;
-    let started = meta.get("startedTs")?.as_i64()?;
-    let frames = meta.get("frames")?.as_array()?;
-    let ts_of = |name: &str| frames.iter().find(|f| f.get("file").and_then(|v| v.as_str()) == Some(name)).and_then(|f| f.get("ts")?.as_i64());
-    files.iter().map(|p| ts_of(p.file_name()?.to_str()?).map(|ts| ts - started)).collect()
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Meta {
+        started_ts: i64,
+        frames: Vec<FrameTs>,
+    }
+    #[derive(serde::Deserialize)]
+    struct FrameTs {
+        file: String,
+        ts: i64,
+    }
+    let meta: Meta = serde_json::from_str(&std::fs::read_to_string(dir.join("part.json")).ok()?).ok()?;
+    let ts: std::collections::HashMap<&str, i64> = meta.frames.iter().map(|f| (f.file.as_str(), f.ts)).collect();
+    files.iter().map(|p| ts.get(p.file_name()?.to_str()?).map(|t| t - meta.started_ts)).collect()
+}
+
+/// 只读文件头，确认这种格式解得开。
+pub fn probe(path: &Path) -> Result<(), String> {
+    let fail = |e: &dyn std::fmt::Display| format!("解码 {} 失败：{e}", path.display());
+    image::ImageReader::open(path).map_err(|e| fail(&e))?.with_guessed_format().map_err(|e| fail(&e))?.into_dimensions().map_err(|e| fail(&e))?;
+    Ok(())
 }
 
 /// 读成 8 位灰度。彩色 / 16 位图按亮度换算。

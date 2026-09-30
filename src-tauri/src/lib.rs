@@ -4,6 +4,7 @@ mod commands;
 mod cycle;
 mod follow;
 mod frame;
+mod fsio;
 mod history;
 mod inspection;
 mod judge;

@@ -35,7 +35,7 @@ struct FrameMeta {
 
 enum Msg {
     Frame { path: PathBuf, image: Arc<FrameImage> },
-    Finish { pending: PathBuf, target: Option<PathBuf>, meta: serde_json::Value, keep: u32, max_bytes: u64 },
+    Finish { pending: PathBuf, target: Option<PathBuf>, meta: serde_json::Value, keep: u32, max_bytes: u64, in_use: Vec<PathBuf> },
 }
 
 /// 正在录制的一件。
@@ -46,8 +46,6 @@ pub struct Recording {
     sn: u32,
     recipe: Arc<Recipe>,
     mode: RecordMode,
-    /// 相机组序号 → 相机编号（本件开工时）
-    cameras: Vec<(u8, String)>,
     seq: Vec<u32>,
     frames: Vec<FrameMeta>,
     dropped: u32,
@@ -72,7 +70,7 @@ impl Recorder {
         &self.root
     }
 
-    pub fn begin(&self, mode: RecordMode, sn: u32, recipe: Arc<Recipe>, cameras: Vec<(u8, String)>) -> Option<Recording> {
+    pub fn begin(&self, mode: RecordMode, sn: u32, recipe: Arc<Recipe>) -> Option<Recording> {
         if mode == RecordMode::Off {
             return None;
         }
@@ -84,21 +82,20 @@ impl Recorder {
             sn,
             recipe,
             mode,
-            cameras,
             seq: Vec::new(),
             frames: Vec::new(),
             dropped: 0,
         })
     }
 
-    pub fn frame(&self, rec: &mut Recording, f: &Frame) {
+    /// camera：拍这一帧的相机编号。
+    pub fn frame(&self, rec: &mut Recording, f: &Frame, camera: &str) {
         let Some(image) = f.image.clone() else { return };
         let cam = f.cam as usize;
         if rec.seq.len() <= cam {
             rec.seq.resize(cam + 1, 0);
         }
         rec.seq[cam] += 1;
-        let camera = rec.cameras.iter().find(|(c, _)| *c == f.cam).map_or_else(|| format!("cam{}", cam + 1), |(_, id)| id.clone());
         let file = format!("{camera}_{:06}.pgm", rec.seq[cam]);
         if self.queued.load(Ordering::Relaxed) >= QUEUE {
             rec.dropped += 1;
@@ -110,10 +107,11 @@ impl Recorder {
             rec.dropped += 1;
             return;
         }
-        rec.frames.push(FrameMeta { cam: f.cam, camera, seq: rec.seq[cam], file, ts: f.ts, frame_counter: f.frame_counter, trigger_counter: f.trigger_counter });
+        rec.frames.push(FrameMeta { cam: f.cam, camera: camera.to_string(), seq: rec.seq[cam], file, ts: f.ts, frame_counter: f.frame_counter, trigger_counter: f.trigger_counter });
     }
 
-    pub fn finish(&self, rec: Recording, verdict: Verdict, reason: &str, keep: u32, max_bytes: u64) {
+    /// in_use：回放相机正在用的目录，滚动删除时跳过。
+    pub fn finish(&self, rec: Recording, verdict: Verdict, reason: &str, keep: u32, max_bytes: u64, in_use: Vec<PathBuf>) {
         let failed = !matches!(verdict, Verdict::Ok | Verdict::OkWithExcursion);
         let keep_this = rec.mode == RecordMode::All || failed;
         let tag = serde_json::to_value(verdict).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
@@ -128,7 +126,7 @@ impl Recorder {
             "droppedFrames": rec.dropped,
         });
         // 收尾消息不能丢，否则临时目录留在那里；通道不限长，这里不会阻塞检测节拍
-        let _ = self.tx.send(Msg::Finish { pending: rec.dir, target, meta, keep, max_bytes });
+        let _ = self.tx.send(Msg::Finish { pending: rec.dir, target, meta, keep, max_bytes, in_use });
     }
 }
 
@@ -145,7 +143,7 @@ fn writer(root: PathBuf, rx: Receiver<Msg>, queued: Arc<AtomicUsize>) {
                 drop(image);
                 queued.fetch_sub(1, Ordering::Relaxed);
             }
-            Msg::Finish { pending, target, meta, keep, max_bytes } => {
+            Msg::Finish { pending, target, meta, keep, max_bytes, in_use } => {
                 let _ = std::fs::create_dir_all(&pending);
                 let _ = std::fs::write(pending.join("part.json"), serde_json::to_string_pretty(&meta).unwrap_or_default());
                 match target {
@@ -159,7 +157,7 @@ fn writer(root: PathBuf, rx: Receiver<Msg>, queued: Arc<AtomicUsize>) {
                         let _ = std::fs::remove_dir_all(&pending);
                     }
                 }
-                prune(&root, keep as usize, max_bytes);
+                prune(&root, keep as usize, max_bytes, &in_use);
             }
         }
     }
@@ -170,7 +168,8 @@ fn dir_bytes(dir: &Path) -> u64 {
 }
 
 /// 只留最新的 keep 件、且总大小不超过 max_bytes（目录名以时间开头，按名字排序即按时间）。
-fn prune(root: &Path, keep: usize, max_bytes: u64) {
+fn prune(root: &Path, keep: usize, max_bytes: u64, in_use: &[PathBuf]) {
+    let in_use: Vec<PathBuf> = in_use.iter().filter_map(|p| p.canonicalize().ok()).collect();
     let mut parts: Vec<PathBuf> = Vec::new();
     let Ok(days) = std::fs::read_dir(root) else { return };
     for day in days.flatten().map(|d| d.path()).filter(|p| p.is_dir() && !p.ends_with("_pending")) {
@@ -183,7 +182,7 @@ fn prune(root: &Path, keep: usize, max_bytes: u64) {
     for (i, p) in parts.iter().enumerate() {
         total += dir_bytes(p);
         // 最新的一件总是留着
-        if i > 0 && (i >= keep || total > max_bytes) {
+        if i > 0 && (i >= keep || total > max_bytes) && !p.canonicalize().is_ok_and(|c| in_use.contains(&c)) {
             let _ = std::fs::remove_dir_all(p);
             if let Some(day) = p.parent() {
                 let _ = std::fs::remove_dir(day);

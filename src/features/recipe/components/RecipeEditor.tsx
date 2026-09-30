@@ -23,41 +23,53 @@ const paramFields: [keyof JudgeParams, string][] = [
 
 const pointsText = (pts: [number, number][]) => pts.map(([x, y]) => `${x}, ${y}`).join("\n");
 
-const cells = (line: string) => line.split(/[,;\s\t]+/).filter(Boolean);
+const cells = (line: string) =>
+  line
+    .split(/[,;\t ]/)
+    .map((c) => c.trim())
+    .filter(Boolean);
 
-/** 每行开头连续的数（与导入 CSV 一样，遇到不是数的就停），至少两个才算一个点。 */
+/** 按 Rust 的 f32 解析认数（nan、inf 也算数），解不了返回 null。 */
+function num(c: string): number | null {
+  if (/^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i.test(c)) return Number(c);
+  const m = /^([+-]?)(inf|infinity|nan)$/i.exec(c);
+  return m ? (m[2].toLowerCase() === "nan" ? NaN : m[1] === "-" ? -Infinity : Infinity) : null;
+}
+
+/** 每行开头连续的数（遇到不是数的就停），前两个是有限数才算一个点。 */
 function parseRows(text: string): number[][] {
   return text
     .split(/\r?\n/)
     .map((l) => {
       const out: number[] = [];
       for (const c of cells(l)) {
-        const v = Number(c);
-        if (!Number.isFinite(v)) break;
+        const v = num(c);
+        if (v === null) break;
         out.push(v);
       }
       return out;
     })
-    .filter((v) => v.length >= 2);
+    .filter((v) => v.length >= 2 && Number.isFinite(v[0]) && Number.isFinite(v[1]));
 }
 
 function parseText(text: string): [number, number][] {
   return parseRows(text).map((v) => [v[0], v[1]] as [number, number]);
 }
 
-/** 胶路文本：每行 x, y；有圆弧时首行写表头 "x, y, bulge"，第 3 列是从这一点出发那条边的 bulge。 */
+/** 有圆弧时首行写表头 "x, y, bulge"。 */
 const pathText = (pts: [number, number][], bulges: number[] = []) => {
   const arcs = bulges.some((b) => b);
   const rows = pts.map(([x, y], i) => (arcs ? `${x}, ${y}, ${Number((bulges[i] ?? 0).toFixed(6))}` : `${x}, ${y}`));
   return (arcs ? ["x, y, bulge", ...rows] : rows).join("\n");
 };
 
-/** 与导入 CSV 同一个规矩：第 3 列起默认不认（常见的是高度 z），表头写明 bulge 的那一列才当圆弧参数。 */
+/** 与导入 CSV（recipe.rs 的 csv_path）同一个规矩。 */
 function parsePathText(text: string): { points: [number, number][]; bulges: number[] } {
-  const head = text.split(/\r?\n/).map(cells).find((c) => c.length > 0);
-  const col = head?.some((c) => !Number.isFinite(Number(c))) ? head.findIndex((c) => c.toLowerCase() === "bulge") : -1;
+  const first = text.split(/\r?\n/).find((l) => cells(l).length > 0);
+  const head = first ? cells(first) : [];
+  const col = head.some((c) => num(c) === null) ? head.findIndex((c) => c.toLowerCase() === "bulge") : -1;
   const rows = parseRows(text);
-  const bulges = rows.map((v) => (col >= 0 ? (v[col] ?? 0) : 0));
+  const bulges = rows.map((v) => (col >= 0 && Number.isFinite(v[col]) ? v[col] : 0));
   return { points: rows.map((v) => [v[0], v[1]] as [number, number]), bulges: bulges.some((b) => b !== 0) ? bulges : [] };
 }
 

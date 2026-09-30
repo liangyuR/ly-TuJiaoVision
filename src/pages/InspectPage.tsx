@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { RotateCcw } from "lucide-react";
 import Modal from "../features/plc/components/Modal";
 import { cameraApi, useRigStatus, type CameraConfig } from "../features/camera";
+import { triggerModeLabel, verdictLabel } from "../features/history";
 import {
   CameraTile,
   computeVis,
@@ -24,16 +25,6 @@ import {
   type Verdict,
 } from "../features/cycle";
 
-const verdictText: Record<Verdict, string> = {
-  OK: "OK",
-  OK_WITH_EXCURSION: "OK · 局部超差",
-  NG_POSITION: "NG · 位置超差",
-  NG_WIDTH: "NG · 胶宽超差",
-  NG_ABSOLUTE: "NG · 超绝对限",
-  NG_GAP: "NG · 断胶",
-  ERR_INSPECT: "ERR · 未测成",
-};
-
 function verdictTone(v: Verdict) {
   return v.startsWith("OK") ? "v-ok" : v === "ERR_INSPECT" ? "v-err" : "v-ng";
 }
@@ -55,7 +46,6 @@ export default function InspectPage() {
   const part = snapshot?.part ?? null;
   const layoutId = part?.recipeId ?? snapshot?.activeRecipeId ?? recipes[0]?.id;
   const summary = recipes.find((r) => r.id === layoutId);
-  // 有工件时按它开工时的配方快照画：配方刚改过（比如改了间距），测量点序号对的还是那一版
   const layout = useLayout(layoutId, part ? part.recipeHash : summary?.hash);
   const phase = snapshot?.phase ?? "IDLE";
   const settled = phase === "REPORT" || phase === "RELEASE" || phase === "IDLE" || phase === "FAULT";
@@ -73,7 +63,7 @@ export default function InspectPage() {
   const partKey = follow ? `${part?.sn}:${part?.recipeHash}` : part;
   const resultKey = partResult ? `${partResult.sn}:${partResult.ts}` : null;
   const vis = useMemo(
-    () => (layout && ownLayout ? computeVis(layout, part, shown, partResult) : []),
+    () => (layout ? computeVis(layout, ownLayout ? part : null, shown, ownLayout ? partResult : null) : []),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [layout, ownLayout, partKey, shown, resultKey],
   );
@@ -102,7 +92,7 @@ export default function InspectPage() {
   return (
     <div className="fly">
       <div className="fly-bar">
-        <span className="fly-chip">{follow ? "三目随动" : trigger === "stop" ? "停稳拍" : "飞拍"}</span>
+        <span className="fly-chip">{follow ? "三目随动" : triggerModeLabel(trigger)}</span>
         {snapshot?.productSource === "manual" ? (
           <span className="fly-chip">
             配方
@@ -287,7 +277,7 @@ function VerdictCard({ phase, result, sn }: { phase: string; result: ResultView 
         <span>判定结果 · SN {result.sn}</span>
         <span className="mono">PLC {result.plcCode}{result.faultCode ? ` / ${result.faultCode}` : ""}</span>
       </div>
-      <strong>{verdictText[result.verdict]}</strong>
+      <strong>{verdictLabel[result.verdict]}</strong>
       <div className="vr">{result.reason}</div>
     </div>
   );

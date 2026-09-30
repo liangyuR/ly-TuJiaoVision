@@ -153,18 +153,22 @@ impl Progress {
         Self { zero, samples: VecDeque::new(), speed: 0.0, gap: poll_ms.max(10.0) }
     }
 
-    fn update(&mut self, value: f32, poll_ts: i64) {
-        let zero = *self.zero.get_or_insert(value);
-        if value < zero - 1e-3 {
+    fn update(&mut self, raw: f32, poll_ts: i64) {
+        if !raw.is_finite() {
+            return;
+        }
+        let zero = *self.zero.get_or_insert(raw);
+        // 还没走就比零点小：PLC 布防后才清零，零点回到 0；走起来以后进度不会往回走，变小是 PLC 收尾清零或抖动，不理
+        if raw < zero - 1e-3 && self.samples.len() <= 1 {
             self.zero = Some(0.0);
             self.samples.clear();
         }
-        let value = value - self.zero.unwrap();
+        let value = raw - self.zero.unwrap();
         let Some(&(pv, pt)) = self.samples.back() else {
             self.samples.push_back((value, poll_ts));
             return;
         };
-        if (value - pv).abs() <= 1e-3 || poll_ts <= pt {
+        if value <= pv + 1e-3 || poll_ts <= pt {
             return;
         }
         let dt = (poll_ts - pt) as f32;
@@ -195,7 +199,7 @@ impl Progress {
         if dt <= 3.0 * self.gap || self.speed <= 0.0 {
             v0 + (v1 - v0) * (frame_ts - t0) as f32 / dt
         } else {
-            (v1 - self.speed * (t1 - frame_ts) as f32 / 1000.0).clamp(v0, v1)
+            (v1 - self.speed * (t1 - frame_ts) as f32 / 1000.0).max(v0).min(v1)
         }
     }
 }
@@ -210,7 +214,7 @@ pub struct Plan {
 /// 单帧横向同步的修正量只采纳这么多，压住单帧噪声。
 const LATERAL_GAIN: f32 = 0.7;
 
-/// 开工时的 PLC 进度信息：寄存器此刻的原始值（按进度定位时当零点）与轮询周期。
+/// 开工时的 PLC 进度信息：寄存器此刻的原始值（按进度定位时当零点，读不到说明地址表里没有这个点位）与轮询周期。
 pub struct PlcStart {
     pub zero: Option<f32>,
     pub poll_ms: f32,
@@ -223,10 +227,11 @@ impl Tracker {
         if cams.is_empty() {
             return Err("随动相机都没有标定".into());
         }
-        let zero = match spec.timing {
-            FollowTiming::Plc { scale } => plc.zero.map(|v| v * scale),
-            FollowTiming::Timed { .. } => None,
-        };
+        let mut progress = Progress::new(None, plc.poll_ms);
+        if let (FollowTiming::Plc { scale }, Some(zero)) = (&spec.timing, plc.zero) {
+            // 布防这一刻胶嘴在起点
+            progress.update(zero * scale, armed_ts);
+        }
         let n = recipe.point_count();
         Ok(Self {
             recipe,
@@ -238,27 +243,29 @@ impl Tracker {
             start_probe_pending: false,
             generation: 0,
             start_delta: 0.0,
-            plc: Progress::new(zero, plc.poll_ms),
+            plc: progress,
             last_s: vec![None; 8],
             advance: 0.0,
             spec,
         })
     }
 
-    /// 按 PLC 进度定位（每帧要读进度寄存器）。
     pub fn uses_plc(&self) -> bool {
         matches!(self.spec.timing, FollowTiming::Plc { .. })
     }
 
-    /// 胶嘴位置：按时间推算（或用 PLC 给的进度），再加上从图像里同步出来的修正。
-    /// plc_progress：PLC 进度寄存器的值与读到它的轮询时刻。
-    pub fn nozzle_s(&mut self, ts: i64, plc_progress: Option<(f32, i64)>) -> Option<f32> {
+    /// PLC 进度寄存器的一次变化（原始值与读到它的轮询时刻）。
+    pub fn feed_progress(&mut self, raw: f32, poll_ts: i64) {
+        if let FollowTiming::Plc { scale } = self.spec.timing {
+            self.plc.update(raw * scale, poll_ts);
+        }
+    }
+
+    /// 帧拍下时胶嘴的位置：按时间推算（或按 PLC 进度），再加上从图像里同步出来的修正。按进度定位却一次都没读到进度时返回 None。
+    pub fn nozzle_s(&mut self, ts: i64) -> Option<f32> {
         let raw = match self.spec.timing {
             FollowTiming::Timed { speed_mm_s, delay_ms } => Some(speed_mm_s * ((ts - self.armed_ts) as f32 - delay_ms) / 1000.0),
-            FollowTiming::Plc { scale } => plc_progress.map(|(p, poll_ts)| {
-                self.plc.update(p * scale, poll_ts);
-                self.plc.at(ts)
-            }),
+            FollowTiming::Plc { .. } => (!self.plc.samples.is_empty()).then(|| self.plc.at(ts)),
         };
         raw.map(|s| s + self.offset)
     }
@@ -425,6 +432,9 @@ mod tests {
             assert!(moving < moving_tol, "轮询 {poll} ms：运动中误差 {moving:.2} mm");
             if poll == 50 {
                 assert!(stopped < 0.2, "停下后还在往前推：误差 {stopped:.2} mm");
+                // 收尾时 PLC 把进度清零，之前拍的帧还在处理：还按走过的进度取
+                p.update(0.0, 2800);
+                assert!((p.at(2490) - truth(2490)).abs() < moving_tol);
             }
         }
     }

@@ -134,7 +134,7 @@ fn camera_refs<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error>
     Ok(Vec::<CameraRef>::deserialize(d)?.into_iter().map(CameraRef::id).collect())
 }
 
-/// 相机编号：字母、数字、- 和 _，最长 32 个字符。
+/// 相机、配方编号：字母、数字、- 和 _，最长 32 个字符。
 pub fn valid_camera_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 32 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
@@ -269,9 +269,9 @@ impl Recipe {
         if self.closed { n * self.spacing } else { (n - 1.0).max(0.0) * self.spacing }
     }
 
-    /// 只看胶路几何与拍照点的哈希：示教资料跟它走，改判定限值不用重新示教。
+    /// 只看胶路几何、拍照点与飞拍相机的哈希：示教资料（那台相机拍的模板）跟它走，改判定限值不用重新示教。
     pub fn geometry_hash(&self) -> String {
-        let key = serde_json::json!([self.path, self.part, self.spacing, self.shots, self.fov, self.closed]);
+        let key = serde_json::json!([self.path, self.part, self.spacing, self.shots, self.fov, self.closed, self.camera]);
         fnv_hex(&serde_json::to_vec(&key).unwrap_or_default())
     }
 
@@ -490,8 +490,7 @@ const RECT_NAMES: [&str; 8] = ["长边 A", "R 角 1", "短边 B", "R 角 2", "�
 
 impl RecipeDoc {
     pub fn validate(&self) -> Result<(), String> {
-        let id_ok = !self.id.is_empty() && self.id.len() <= 32 && self.id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
-        if !id_ok {
+        if !valid_camera_id(&self.id) {
             return Err("配方编号只能用字母、数字、- 和 _，最长 32 个字符".into());
         }
         if self.name.trim().is_empty() {
@@ -864,9 +863,9 @@ fn csv_path(text: &str) -> ImportedPath {
     let mut path = ImportedPath::default();
     for l in text.lines() {
         let v: Vec<f32> = csv_cells(l).into_iter().map_while(|s| s.parse::<f32>().ok()).collect();
-        if v.len() >= 2 && v.iter().all(|x| x.is_finite()) {
+        if v.len() >= 2 && v[0].is_finite() && v[1].is_finite() {
             path.points.push([v[0], v[1]]);
-            path.bulges.push(bulge_col.and_then(|c| v.get(c).copied()).unwrap_or(0.0));
+            path.bulges.push(bulge_col.and_then(|c| v.get(c).copied()).filter(|b| b.is_finite()).unwrap_or(0.0));
         }
     }
     path
@@ -1088,12 +1087,14 @@ pub struct RecipeStore {
     dir: PathBuf,
     inner: RwLock<Vec<(RecipeDoc, Arc<Recipe>)>>,
     errors: RwLock<Vec<String>>,
+    /// 没能加载的文件名（小写、不含扩展名），保存时不能覆盖
+    rejected: RwLock<Vec<String>>,
 }
 
 impl RecipeStore {
     pub fn open(dir: PathBuf) -> Result<Self, String> {
         std::fs::create_dir_all(&dir).map_err(|e| format!("创建配方目录失败：{e}"))?;
-        let store = Self { dir, inner: RwLock::new(Vec::new()), errors: RwLock::new(Vec::new()) };
+        let store = Self { dir, inner: RwLock::new(Vec::new()), errors: RwLock::new(Vec::new()), rejected: RwLock::new(Vec::new()) };
         let empty = std::fs::read_dir(&store.dir).map_err(|e| e.to_string())?.flatten().all(|e| e.path().extension().is_none_or(|x| x != "json"));
         if empty {
             for doc in samples() {
@@ -1118,6 +1119,7 @@ impl RecipeStore {
     pub fn reload(&self) {
         let mut list = Vec::new();
         let mut errors = Vec::new();
+        let mut rejected = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&self.dir) {
             let mut paths: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")).collect();
             paths.sort();
@@ -1141,12 +1143,16 @@ impl RecipeStore {
                 });
                 match checked {
                     Ok(pair) => list.push(pair),
-                    Err(e) => errors.push(format!("{name}：{e}")),
+                    Err(e) => {
+                        errors.push(format!("{name}：{e}"));
+                        rejected.push(stem.to_ascii_lowercase());
+                    }
                 }
             }
         }
         *self.inner.write().unwrap() = list;
         *self.errors.write().unwrap() = errors;
+        *self.rejected.write().unwrap() = rejected;
     }
 
     pub fn list(&self) -> Vec<Arc<Recipe>> {
@@ -1177,6 +1183,9 @@ impl RecipeStore {
             } else {
                 format!("产品代码 {} 已被配方 {} 使用", doc.product_code, d.id)
             });
+        }
+        if self.rejected.read().unwrap().contains(&doc.id.to_ascii_lowercase()) {
+            return Err(format!("配方目录里的 {}.json 没能加载（见配方页的提示），先修好或移走那个文件再用这个编号", doc.id));
         }
         let old = inner.iter().find(|(d, _)| d.id == replacing).map(|(d, r)| (d.version, r.hash.clone()));
         doc.version = match old {

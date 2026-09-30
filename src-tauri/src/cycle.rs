@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -10,7 +11,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 
-use crate::camera::{Acquisition, CameraRig, FRAME_QUEUE};
+use crate::camera::{Acquisition, CameraRig, CameraSource, FRAME_QUEUE};
 use crate::follow::{PlcStart, Tracker};
 use crate::frame::Frame;
 use crate::history;
@@ -224,6 +225,11 @@ pub struct CycleHost {
     settings_path: PathBuf,
     shared: Mutex<Shared>,
     rx: Mutex<Option<(UnboundedReceiver<Input>, Receiver<Frame>)>>,
+    /// 节拍不在空闲或故障（开工那一刻就置上，比发布的快照早）
+    busy: AtomicBool,
+    /// PLC 每次轮询读到的进度寄存器变化（原始值、轮询时刻），随动按进度定位时逐条喂给 Tracker
+    progress: Mutex<VecDeque<(f32, i64)>>,
+    settings_note: Option<String>,
 }
 
 impl CycleHost {
@@ -232,6 +238,7 @@ impl CycleHost {
         let data = app.path().app_data_dir().map_err(|e| e.to_string())?;
         let (tx, rx) = unbounded_channel();
         let (frame_tx, frame_rx) = channel(FRAME_QUEUE);
+        let (settings, settings_note) = CycleSettings::load(&settings_path);
         Ok(Self {
             camera: CameraRig::new(app, frame_tx)?,
             tx,
@@ -243,10 +250,13 @@ impl CycleHost {
                 logs: VecDeque::new(),
                 measured: Vec::new(),
                 part_recipe: None,
-                settings: CycleSettings::load(&settings_path),
+                settings,
             }),
             settings_path,
             rx: Mutex::new(Some((rx, frame_rx))),
+            busy: AtomicBool::new(false),
+            progress: Mutex::new(VecDeque::new()),
+            settings_note,
         })
     }
 
@@ -257,8 +267,8 @@ impl CycleHost {
         for e in host.recipes.errors() {
             log(app, "err", "配方", e);
         }
-        for e in &host.camera.notes {
-            log(app, "err", "相机组", e.clone());
+        for e in host.camera.notes.iter().chain(&host.settings_note) {
+            log(app, "err", "配置", e.clone());
         }
         tauri::async_runtime::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(20));
@@ -282,6 +292,18 @@ impl CycleHost {
 
     pub fn phase(&self) -> Phase {
         self.shared.lock().unwrap().snapshot.as_ref().map_or(Phase::Idle, |s| s.phase)
+    }
+
+    pub fn busy(&self) -> bool {
+        self.busy.load(Ordering::SeqCst)
+    }
+
+    pub fn push_progress(&self, raw: f32, poll_ts: i64) {
+        let mut q = self.progress.lock().unwrap();
+        q.push_back((raw, poll_ts));
+        if q.len() > 1024 {
+            q.pop_front();
+        }
     }
 
     pub fn recipe(&self, id: &str) -> Option<Arc<Recipe>> {
@@ -356,6 +378,8 @@ struct Part {
     /// 本件用到的相机（相机组序号）与对应的相机编号
     cams: Vec<u8>,
     camera_ids: Vec<String>,
+    /// 开工时相机组的版本：检测中增删了相机，cams 里的序号就不对了
+    rig_gen: u64,
     /// 随动：每个点当前读数是哪一代胶嘴位置测的（起点同步后 +1），旧一代的结果不覆盖新一代
     point_gen: Vec<u32>,
     /// 随动：各帧分到的点与发出时的代数，测量失败时放回去重测
@@ -470,10 +494,17 @@ fn apply_follow(part: &mut Part, m: &Measured, assigned: Vec<u32>, job_gen: u32)
     sync_log
 }
 
-/// 配方用的相机此刻在相机组里的序号。相机不在相机组里、采集方式与工况不符、随动相机没标定时返回原因。
-fn usable_cams(host: &CycleHost, recipe: &Recipe) -> Result<Vec<u8>, String> {
+fn missing_recipe(id: &str) -> String {
+    format!("选中的配方 {id} 不存在或没能加载（见配方页）")
+}
+
+/// 配方用的相机此刻在相机组里的序号。相机不在相机组里、采集方式与工况不符、随动相机没标定、
+/// 海康相机却没开图像测量时返回原因。
+pub fn usable_cams(host: &CycleHost, recipe: &Recipe) -> Result<Vec<u8>, String> {
     let cams = host.camera.resolve(&recipe.cameras())?;
     let follow = recipe.mode == InspectMode::Follow;
+    let settings = host.settings();
+    let image = if follow { settings.follow_vision } else { settings.vision };
     for &c in &cams {
         let cfg = host.camera.slot(c as usize).ok_or("相机组改过了")?.config();
         let free_run = cfg.acquisition == Acquisition::FreeRun;
@@ -486,15 +517,22 @@ fn usable_cams(host: &CycleHost, recipe: &Recipe) -> Result<Vec<u8>, String> {
         if follow && cfg.follow.is_none() {
             return Err(format!("{}（{}）还没做随动标定（图像源页 → 随动标定）", cfg.name, cfg.id));
         }
+        // 模拟测量不看图，真实工件按模拟结果回写就是把实物判了 OK
+        if !image && cfg.source == CameraSource::Mvs {
+            return Err(format!("{}（{}）是海康相机，{}的图像测量却没打开（系统设置）", cfg.name, cfg.id, if follow { "随动" } else { "飞拍" }));
+        }
     }
     Ok(cams)
 }
 
-/// 空闲时要就绪的相机：配方、相机组或设置变了（Refresh）才重算。
+/// 空闲时对相机的要求：配方、设置变了（Refresh）或相机组增删过才重算。
 struct Required {
-    /// 人工选型号时是选中配方的相机（配方开不了工时是原因）；PLC 下发型号时是所有开得了工的配方用到的相机
+    rig_gen: u64,
+    /// 必须就绪、否则停在故障的相机：人工选型号时是选中配方的（配方开不了工时是原因）；PLC 下发型号时没有
     cams: Result<Vec<u8>, String>,
-    /// PLC 下发型号时开不了工的配方：只报警，不拦别的型号
+    /// PLC 下发型号时各配方的相机：没就绪只报警，那个型号开工时判 ERR，别的型号照常
+    watch: Vec<(String, Vec<u8>)>,
+    /// 配置上就开不了工的配方
     warnings: Vec<String>,
 }
 
@@ -517,6 +555,7 @@ struct Machine {
     alarms: Vec<String>,
     required: Option<Required>,
     config_warnings: Vec<String>,
+    camera_warnings: Vec<String>,
     dirty: bool,
     published: Instant,
     dropped_seen: u64,
@@ -544,6 +583,7 @@ impl Machine {
             alarms: Vec::new(),
             required: None,
             config_warnings: Vec::new(),
+            camera_warnings: Vec::new(),
             dirty: true,
             published: Instant::now(),
             dropped_seen: 0,
@@ -552,6 +592,7 @@ impl Machine {
 
     fn set_phase(&mut self, phase: Phase) {
         self.phase = phase;
+        host(&self.app).busy.store(!matches!(phase, Phase::Idle | Phase::Fault), Ordering::SeqCst);
         self.since = now_ms();
         self.dirty = true;
     }
@@ -576,26 +617,34 @@ impl Machine {
 
     fn compute_required(&self) -> Required {
         let host = host(&self.app);
-        match host.settings().product_source {
-            ProductSource::Manual => Required { cams: self.current_recipe().map_or(Ok(Vec::new()), |r| usable_cams(host, &r)), warnings: Vec::new() },
+        let rig_gen = host.camera.generation();
+        let settings = host.settings();
+        match settings.product_source {
+            ProductSource::Manual => {
+                let cams = match (self.current_recipe(), settings.manual_recipe_id.as_deref()) {
+                    (Some(r), _) => usable_cams(host, &r),
+                    (None, Some(id)) => Err(missing_recipe(id)),
+                    (None, None) => Ok(Vec::new()),
+                };
+                Required { rig_gen, cams, watch: Vec::new(), warnings: Vec::new() }
+            }
             ProductSource::Plc => {
-                let (mut cams, mut warnings) = (Vec::new(), Vec::new());
+                let (mut watch, mut warnings) = (Vec::new(), Vec::new());
                 for r in host.recipes.list() {
                     match usable_cams(host, &r) {
-                        Ok(c) => cams.extend(c),
+                        Ok(c) => watch.push((r.id.clone(), c)),
                         Err(e) => warnings.push(format!("配方 {} 开不了工：{e}", r.id)),
                     }
                 }
-                cams.sort_unstable();
-                cams.dedup();
-                Required { cams: Ok(cams), warnings }
+                Required { rig_gen, cams: Ok(Vec::new()), watch, warnings }
             }
         }
     }
 
     /// 空闲、故障时的相机检查：没被配方用到的备用相机不拦着开工。
     fn check_idle_cams(&mut self) -> Result<(), String> {
-        if self.required.is_none() {
+        let host = host(&self.app);
+        if self.required.as_ref().is_none_or(|r| r.rig_gen != host.camera.generation()) {
             let req = self.compute_required();
             for w in req.warnings.iter().filter(|w| !self.config_warnings.contains(w)) {
                 log(&self.app, "err", "配方", w.clone());
@@ -606,10 +655,20 @@ impl Machine {
             }
             self.required = Some(req);
         }
-        match &self.required.as_ref().unwrap().cams {
-            Ok(cams) => host(&self.app).camera.check_ready_at(cams),
+        let req = self.required.as_ref().unwrap();
+        let down: Vec<String> = req.watch.iter().filter_map(|(id, cams)| host.camera.check_ready_at(cams).err().map(|e| format!("配方 {id} 暂时开不了工：{e}"))).collect();
+        let result = match &req.cams {
+            Ok(cams) => host.camera.check_ready_at(cams),
             Err(e) => Err(e.clone()),
+        };
+        if down != self.camera_warnings {
+            for w in down.iter().filter(|w| !self.camera_warnings.contains(w)) {
+                log(&self.app, "warn", "相机", w.clone());
+            }
+            self.camera_warnings = down;
+            self.dirty = true;
         }
+        result
     }
 
     fn publish(&mut self) {
@@ -629,7 +688,7 @@ impl Machine {
             result: self.result.clone(),
             stats: self.stats.clone(),
             stray_frames: self.stray,
-            alarms: self.alarms.iter().chain(&self.config_warnings).cloned().collect(),
+            alarms: self.alarms.iter().chain(&self.config_warnings).chain(&self.camera_warnings).cloned().collect(),
         };
         host.shared.lock().unwrap().snapshot = Some(snapshot.clone());
         let _ = self.app.emit("cycle://snapshot", snapshot);
@@ -703,9 +762,10 @@ impl Machine {
             ProductSource::Manual => settings.manual_recipe_id.as_deref().and_then(|id| host.recipe(id)),
         };
         let Some(recipe) = recipe else {
-            let reason = match settings.product_source {
-                ProductSource::Plc => format!("产品代码 {code} 没有对应的配方"),
-                ProductSource::Manual => "未选择配方".to_string(),
+            let reason = match (settings.product_source, settings.manual_recipe_id.as_deref()) {
+                (ProductSource::Plc, _) => format!("产品代码 {code} 没有对应的配方"),
+                (ProductSource::Manual, Some(id)) => missing_recipe(id),
+                (ProductSource::Manual, None) => "未选择配方".to_string(),
             };
             return self.refuse(sn, None, fault::NO_RECIPE, reason).await;
         };
@@ -725,8 +785,9 @@ impl Machine {
         }
         let tracker = if follow {
             let calibs: Vec<_> = cams.iter().filter_map(|&c| host.camera.slot(c as usize).and_then(|s| s.config().follow).map(|f| (c, f))).collect();
-            // 布防这一刻进度寄存器里的值当零点（PLC 没清零、或第一帧到时机器人已经走了一段，都不影响）
+            // 布防这一刻进度寄存器里的值当零点（PLC 没清零、或第一帧到时机器人已经走了一段，都不影响）；之前攒的变化不要了
             let by_plc = recipe.follow.as_ref().is_some_and(|f| matches!(f.timing, FollowTiming::Plc { .. }));
+            host.progress.lock().unwrap().clear();
             let start = PlcStart {
                 zero: by_plc.then(|| read_tag_f32_ts(plc(&app), tag::PATH_PROGRESS).map(|(v, _)| v)).flatten(),
                 poll_ms: plc(&app).config().connection.poll_interval_ms as f32,
@@ -740,8 +801,8 @@ impl Machine {
             None
         };
         let camera_ids = recipe.cameras();
-        let recording = host.recorder.begin(settings.record, sn, recipe.clone(), cams.iter().copied().zip(camera_ids.iter().cloned()).collect());
-        host.camera.rewind_recordings(&cams);
+        let recording = host.recorder.begin(settings.record, sn, recipe.clone());
+        host.camera.begin_part(&cams);
         host.shared.lock().unwrap().part_recipe = Some(recipe.clone());
         self.part = Some(Part {
             sn,
@@ -762,6 +823,7 @@ impl Machine {
             follow: tracker,
             cams,
             camera_ids,
+            rig_gen: host.camera.generation(),
             point_gen: vec![0; recipe.point_count()],
             jobs: HashMap::new(),
             nozzle_s: None,
@@ -825,8 +887,9 @@ impl Machine {
             if !part.cams.contains(&f.cam) {
                 return;
             }
+            let camera = part.camera_id(f.cam);
             if let Some(rec) = part.recording.as_mut() {
-                host(&self.app).recorder.frame(rec, &f);
+                host(&self.app).recorder.frame(rec, &f, &camera);
             }
             if part.follow() {
                 return self.on_follow_frame(f);
@@ -879,8 +942,13 @@ impl Machine {
         let Some(part) = self.part.as_mut() else { return };
         part.received += 1;
         let tracker = part.follow.as_mut().unwrap();
-        let progress = if tracker.uses_plc() { read_tag_f32_ts(plc(&app), tag::PATH_PROGRESS) } else { None };
-        let Some(s) = tracker.nozzle_s(f.ts, progress) else {
+        if tracker.uses_plc() {
+            let changes: Vec<(f32, i64)> = host(&app).progress.lock().unwrap().drain(..).collect();
+            for (raw, ts) in changes {
+                tracker.feed_progress(raw, ts);
+            }
+        }
+        let Some(s) = tracker.nozzle_s(f.ts) else {
             if part.last_error.is_none() {
                 part.last_error = Some("PLC 地址表里没有 pathProgress 点位，按进度定位需要它".into());
                 log(&app, "err", "随动", part.last_error.clone().unwrap());
@@ -1004,7 +1072,11 @@ impl Machine {
         let connected = plc(&self.app).status().state == LinkState::Connected;
         let cameras = match self.phase {
             // 在途的件只看它自己用的相机；等 PLC 确认结果时相机掉线不打断握手，回到空闲再查
-            Phase::Acquire | Phase::Drain => self.part.as_ref().map_or(Ok(()), |p| host(&self.app).camera.check_ready_at(&p.cams)),
+            Phase::Acquire | Phase::Drain => match self.part.as_ref() {
+                Some(p) if p.rig_gen != host(&self.app).camera.generation() => Err("检测中增删了相机".into()),
+                Some(p) => host(&self.app).camera.check_ready_at(&p.cams),
+                None => Ok(()),
+            },
             Phase::Report | Phase::Release => Ok(()),
             _ => self.check_idle_cams(),
         };
@@ -1172,7 +1244,9 @@ impl Machine {
         let Some(rec) = self.part.as_mut().filter(|p| p.sn == sn).and_then(|p| p.recording.take()) else { return };
         let host = host(&self.app);
         let settings = host.settings();
-        host.recorder.finish(rec, judgement.verdict, &judgement.reason, settings.record_keep, (settings.record_max_gb as f64 * 1e9) as u64);
+        // 回放相机正在用的录制目录不能被滚动删除
+        let in_use = host.camera.configs().into_iter().filter(|c| c.source == CameraSource::Replay).map(|c| PathBuf::from(c.replay_dir.trim())).collect();
+        host.recorder.finish(rec, judgement.verdict, &judgement.reason, settings.record_keep, (settings.record_max_gb as f64 * 1e9) as u64, in_use);
     }
 
     fn record(&self, sn: u32, recipe_id: Option<&str>, judgement: &Judgement, drain_ms: Option<u64>) {

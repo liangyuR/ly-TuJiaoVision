@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use ly_plc::{Access, ConnectionConfig, DataType, EdgeMode, HeartbeatConfig, PlcConfig, PlcEngine, PlcPoint, PlcValue};
+use ly_plc::{Access, ConnectionConfig, DataType, EdgeMode, HeartbeatConfig, PlcConfig, PlcEngine, PlcPoint, PlcValue, PointValue};
 use serde_json::Value;
 
 pub mod tag {
@@ -30,7 +30,7 @@ pub fn invalidate_tags() {
     *TAG_IDS.write().unwrap() = None;
 }
 
-fn point_id(engine: &PlcEngine, tag: &str) -> Option<String> {
+pub fn point_id(engine: &PlcEngine, tag: &str) -> Option<String> {
     if let Some(map) = TAG_IDS.read().unwrap().as_ref() {
         return map.get(tag).cloned();
     }
@@ -55,16 +55,19 @@ pub fn tag_is_on(engine: &PlcEngine, tag: &str) -> bool {
     read_tag(engine, tag).is_some_and(|v| v.is_truthy())
 }
 
-/// 标签的数值与读到它的轮询时刻（ms）。
-pub fn read_tag_f32_ts(engine: &PlcEngine, tag: &str) -> Option<(f32, i64)> {
-    let id = point_id(engine, tag)?;
-    let v = engine.values().get(&id)?.clone();
-    let x = match v.value? {
-        PlcValue::Int(i) => i as f32,
-        PlcValue::Float(f) => f as f32,
-        PlcValue::Bool(b) => b as u8 as f32,
+/// 点位的数值与读到它的轮询时刻（ms）。
+pub fn value_f32_ts(v: &PointValue) -> Option<(f32, i64)> {
+    let x = match v.value.as_ref()? {
+        PlcValue::Int(i) => *i as f32,
+        PlcValue::Float(f) => *f as f32,
+        PlcValue::Bool(b) => *b as u8 as f32,
     };
     Some((x, v.ts))
+}
+
+pub fn read_tag_f32_ts(engine: &PlcEngine, tag: &str) -> Option<(f32, i64)> {
+    let id = point_id(engine, tag)?;
+    value_f32_ts(engine.values().get(&id)?)
 }
 
 pub fn read_tag_u32(engine: &PlcEngine, tag: &str) -> Option<u32> {

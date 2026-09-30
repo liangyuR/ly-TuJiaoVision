@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Copy, Plus, Trash2 } from "lucide-react";
 import { cameraApi } from "../features/camera";
 import { recipeApi, useLayout, type InspectMode, type RecipeDoc, type RecipeSummary } from "../features/cycle";
+import { triggerModeLabel } from "../features/history";
 import { FlyshotTeach, RecipeEditor } from "../features/recipe";
 
 export default function RecipePage() {
@@ -65,7 +66,7 @@ export default function RecipePage() {
     }
   };
 
-  const saved = useLayout(editing?.originalId, list.find((r) => r.id === editing?.originalId)?.hash);
+  const saved = useLayout(editing?.originalId, list.find((r) => r.id === editing?.originalId)?.hash, true);
 
   return (
     <div className="rcp-page">
@@ -79,7 +80,7 @@ export default function RecipePage() {
               <b className="mono">{r.id}</b>
               <span>{r.name}</span>
               <span className="muted mono">
-                代码 {r.productCode} · v{r.version} · {r.mode === "follow" ? `随动 ${r.cameras.length} 相机` : `${r.triggerMode === "stop" ? "停稳拍" : "飞拍"} N=${r.shotCount}`}
+                代码 {r.productCode} · v{r.version} · {r.mode === "follow" ? `随动 ${r.cameras.length} 相机` : `${triggerModeLabel(r.triggerMode)} N=${r.shotCount}`}
               </span>
             </button>
           ))}

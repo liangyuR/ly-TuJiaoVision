@@ -3,12 +3,13 @@
 use std::sync::Arc;
 
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use crate::camera::Acquisition;
 use crate::cycle::{CycleHost, Input, Phase, RecipeSummary};
 use crate::recipe::{self, default_follow_spec, ImportedPath, InspectMode, Recipe, RecipeDoc};
 use crate::settings::CycleSettings;
+use crate::vision::{self, VisionHost};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,10 +58,20 @@ pub fn recipe_template(cycle: State<'_, CycleHost>, mode: InspectMode) -> Recipe
 }
 
 #[tauri::command]
-pub fn recipe_save(cycle: State<'_, CycleHost>, doc: RecipeDoc, original_id: Option<String>) -> Result<RecipeSummary, String> {
+pub fn recipe_save(app: AppHandle, cycle: State<'_, CycleHost>, doc: RecipeDoc, original_id: Option<String>) -> Result<RecipeSummary, String> {
     let saved: Arc<Recipe> = cycle.recipes.save(doc, original_id.as_deref())?;
-    // 改了编号的配方正被人工选中时，跟着改过去
     if let Some(old) = original_id.filter(|o| *o != saved.id) {
+        // 示教资料按配方编号存，跟着改名
+        if let (Ok(from), Ok(to)) = (vision::taught_dir(&app, &old), vision::taught_dir(&app, &saved.id)) {
+            if from.exists() {
+                if !old.eq_ignore_ascii_case(&saved.id) {
+                    let _ = std::fs::remove_dir_all(&to);
+                }
+                let _ = std::fs::rename(&from, &to);
+            }
+        }
+        app.state::<VisionHost>().forget(&old);
+        // 改了编号的配方正被人工选中时，跟着改过去
         let mut settings = cycle.settings();
         if settings.manual_recipe_id.as_deref() == Some(old.as_str()) {
             settings.manual_recipe_id = Some(saved.id.clone());
@@ -72,12 +83,16 @@ pub fn recipe_save(cycle: State<'_, CycleHost>, doc: RecipeDoc, original_id: Opt
 }
 
 #[tauri::command]
-pub fn recipe_delete(cycle: State<'_, CycleHost>, id: String) -> Result<(), String> {
+pub fn recipe_delete(app: AppHandle, cycle: State<'_, CycleHost>, id: String) -> Result<(), String> {
     let settings = cycle.settings();
     if settings.manual_recipe_id.as_deref() == Some(id.as_str()) && !matches!(cycle.phase(), Phase::Idle | Phase::Fault) {
         return Err("该配方正在检测中，工件结束后再删".into());
     }
     cycle.recipes.delete(&id)?;
+    if let Ok(dir) = vision::taught_dir(&app, &id) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    app.state::<VisionHost>().forget(&id);
     // 删掉的正是人工选中的配方：清掉选择，下一件报"未选择配方"而不是拿着一个不存在的编号
     if settings.manual_recipe_id.as_deref() == Some(id.as_str()) {
         cycle.save_settings(CycleSettings { manual_recipe_id: None, ..settings })?;

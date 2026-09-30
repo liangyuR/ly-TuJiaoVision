@@ -97,16 +97,16 @@ fn yes() -> bool {
 }
 
 impl CycleSettings {
-    pub fn load(path: &Path) -> Self {
-        std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    /// 读不了的文件先备份，返回说明（节拍启动后写日志）。
+    pub fn load(path: &Path) -> (Self, Option<String>) {
+        match crate::fsio::read_json(path) {
+            Ok(s) => (s.unwrap_or_default(), None),
+            Err(note) => (Self::default(), Some(note)),
+        }
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
-        }
-        let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(path, text).map_err(|e| format!("写入配置失败: {e}"))
+        crate::fsio::write_atomic(path, &serde_json::to_string_pretty(self).map_err(|e| e.to_string())?)
     }
 
     pub fn validate(&self) -> Result<(), String> {

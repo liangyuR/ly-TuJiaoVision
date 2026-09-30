@@ -65,10 +65,10 @@ function notifyRecipes() {
 
 /**
  * 配方的运行数据。给了 hash 就要那一版（工件用的配方刚改过，这一件仍按开工时的样子画）。
- * 换了配方还没取回来时返回 null，不拿上一个配方的数据去对新工件的测量点。
+ * 换了配方还没取回来时返回 null，不拿上一个配方的数据去对新工件的测量点；keepPrevious 时同一配方的新版取回来之前先给旧版。
  */
-export function useLayout(recipeId: string | null | undefined, hash?: string) {
-  const [state, setState] = useState<{ key: string; layout: Recipe | null } | null>(null);
+export function useLayout(recipeId: string | null | undefined, hash?: string, keepPrevious = false) {
+  const [state, setState] = useState<{ key: string; id: string; layout: Recipe | null } | null>(null);
   const [gen, setGen] = useState(0);
   const key = recipeId ? `${recipeId}:${hash ?? ""}` : "";
   useEffect(() => {
@@ -78,15 +78,25 @@ export function useLayout(recipeId: string | null | undefined, hash?: string) {
   }, []);
   useEffect(() => {
     if (!recipeId) return;
-    if (!layoutCache.has(key)) layoutCache.set(key, cycleApi.layout(recipeId, hash).catch(() => null));
+    if (!layoutCache.has(key))
+      layoutCache.set(
+        key,
+        cycleApi.layout(recipeId, hash).catch(() => {
+          layoutCache.delete(key);
+          return null;
+        }),
+      );
     let alive = true;
-    layoutCache.get(key)!.then((layout) => alive && setState({ key, layout }));
+    layoutCache.get(key)!.then(
+      (layout) => alive && setState((prev) => (!layout && prev?.key === key && prev.layout ? prev : { key, id: recipeId, layout })),
+    );
     return () => {
       alive = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key, gen]);
-  return state && state.key === key ? state.layout : null;
+  if (!state) return null;
+  return state.key === key || (keepPrevious && state.id === recipeId) ? state.layout : null;
 }
 
 export function useRecipes() {

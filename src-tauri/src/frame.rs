@@ -93,7 +93,7 @@ pub struct Frame {
     /// 软触发（示教取图、回放"下一张"）出来的帧
     #[serde(skip)]
     pub manual: bool,
-    /// 整帧 Mono8 像素。需要图像测量或帧录制时才带上。
+    /// 整帧 Mono8 像素。图像测量、帧录制或手动取图时才带上。
     #[serde(skip)]
     pub image: Option<Arc<FrameImage>>,
 }

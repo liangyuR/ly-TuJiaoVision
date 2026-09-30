@@ -3,10 +3,10 @@ import { useNavigate } from "react-router-dom";
 import Modal from "../../plc/components/Modal";
 import type { Verdict } from "../../cycle/types";
 import { historyApi } from "../api";
-import { formatTime, verdictClass, verdictLabel } from "../meta";
+import { formatTime, verdictClass, verdictGroups, verdictLabel } from "../meta";
 import type { HistoryQuery, KindOverride, Overrides, RejudgeResult } from "../types";
 
-const order: Verdict[] = ["OK", "OK_WITH_EXCURSION", "NG_POSITION", "NG_WIDTH", "NG_ABSOLUTE", "NG_GAP", "ERR_INSPECT"];
+const order: Verdict[] = verdictGroups.flatMap((g) => g.verdicts);
 const kindFields: [keyof KindOverride, string][] = [
   ["tolUpper", "上公差"],
   ["tolLower", "下公差"],
