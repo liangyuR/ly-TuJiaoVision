@@ -151,8 +151,8 @@ const HISTORY_MS: i64 = 3000;
 const CLEAR_DROP_MM: f32 = 1.0;
 
 impl Progress {
-    fn new(zero: Option<f32>, poll_ms: f32) -> Self {
-        Self { zero, samples: VecDeque::new(), speed: 0.0, gap: poll_ms.max(10.0) }
+    fn new(poll_ms: f32) -> Self {
+        Self { zero: None, samples: VecDeque::new(), speed: 0.0, gap: poll_ms.max(10.0) }
     }
 
     fn update(&mut self, raw: f32, poll_ts: i64) {
@@ -229,7 +229,7 @@ impl Tracker {
         if cams.is_empty() {
             return Err("随动相机都没有标定".into());
         }
-        let mut progress = Progress::new(None, plc.poll_ms);
+        let mut progress = Progress::new(plc.poll_ms);
         if let (FollowTiming::Plc { scale }, Some(zero)) = (&spec.timing, plc.zero) {
             // 布防这一刻胶嘴在起点
             progress.update(zero * scale, armed_ts);
@@ -406,7 +406,7 @@ mod tests {
             80.0 * t.min(1.0) + 80.0 * (t - 1.5).max(0.0)
         };
         for (poll, moving_tol) in [(50i64, 1.5f32), (300, 3.0)] {
-            let mut p = Progress::new(Some(0.0), poll as f32);
+            let mut p = Progress::new(poll as f32);
             let mut read = (0.0f32, 0i64);
             let (mut moving, mut stopped) = (0.0f32, 0.0f32);
             let steady = |t: i64| (2 * poll..1000).contains(&t) || (poll == 50 && (1600..2500).contains(&t));

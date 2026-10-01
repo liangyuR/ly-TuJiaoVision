@@ -27,6 +27,12 @@ export default function CameraPage() {
     reload();
   }, []);
 
+  // 序列号留空的相机连上后后台固定了序列号：重新取，别拿旧的空值保存回去
+  const unpinned = statuses.some((s) => s.device && configs[s.cam]?.source === "mvs" && !configs[s.cam]?.serial);
+  useEffect(() => {
+    if (unpinned) reload();
+  }, [unpinned]);
+
   const config = configs[cam] ?? null;
   const status = statuses.find((s) => s.cam === cam) ?? null;
   const frameMs = status?.maxFps ? 1000 / status.maxFps : null;

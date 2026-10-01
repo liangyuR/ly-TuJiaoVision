@@ -151,25 +151,27 @@ fn stats(recipe: &Recipe, table: &[PointState], values: &[Option<f32>], limits: 
     let out = |j: usize| values[j].zip(params[seg(j)].as_ref()).is_some_and(|(v, p)| v < p.lower() || v > p.upper());
     let sp = recipe.spacing;
     for run in runs_where(table, recipe.closed, |j, _| out(j)) {
-        // 各段在这次超差里的点数与首末点
-        let mut per: Vec<(usize, usize, usize, usize)> = Vec::new();
-        for &j in &run {
-            match per.iter_mut().find(|e| e.0 == seg(j)) {
-                Some(e) => {
-                    e.1 += 1;
-                    e.3 = j;
-                }
-                None => per.push((seg(j), 1, j, j)),
+        // 各段在这次超差里的那一截（run 里的下标范围）
+        struct Share {
+            seg: usize,
+            from: usize,
+            to: usize,
+        }
+        let mut shares: Vec<Share> = Vec::new();
+        for (i, &j) in run.iter().enumerate() {
+            match shares.last_mut() {
+                Some(sh) if sh.seg == seg(j) => sh.to = i,
+                _ => shares.push(Share { seg: seg(j), from: i, to: i }),
             }
         }
-        let owner = per.iter().fold(per[0], |best, &e| if e.1 > best.1 { e } else { best }).0;
-        for (g, count, first, last) in per {
-            let (len, at) = if g == owner { (run.len(), (run[0], run[run.len() - 1])) } else { (count, (first, last)) };
-            let len = len as f32 * sp;
-            let s = &mut st[g];
+        let owner = shares.iter().max_by_key(|sh| (sh.to - sh.from, std::cmp::Reverse(sh.from))).unwrap().seg;
+        for sh in &shares {
+            let (from, to) = if sh.seg == owner { (0, run.len() - 1) } else { (sh.from, sh.to) };
+            let len = (to - from + 1) as f32 * sp;
+            let s = &mut st[sh.seg];
             if len > s.excursion_len {
                 s.excursion_len = len;
-                s.excursion_at = Some((at.0 as f32 * sp, (at.1 + 1) as f32 * sp));
+                s.excursion_at = Some((run[from] as f32 * sp, (run[to] + 1) as f32 * sp));
             }
         }
     }

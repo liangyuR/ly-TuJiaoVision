@@ -340,7 +340,7 @@ pub fn sim_start(
     }
     let recipe = cycle.recipe(&recipe_id).ok_or("配方不存在")?;
     // 采集方式、随动标定、图像测量与开工时同一套检查；模拟节拍还要能发出触发
-    for c in crate::cycle::usable_cams(&app, &recipe)? {
+    for c in crate::cycle::usable_cams(&app, &recipe, false)? {
         let cam = cycle.camera.slot(c as usize).ok_or("相机不存在")?.config();
         if recipe.mode == InspectMode::FlyShot && cam.source == CameraSource::Mvs && cam.trigger_source != "Software" {
             return Err("相机触发源为 Line0，模拟节拍发不出硬触发；改为 Software 或切换到模拟相机".into());

@@ -928,11 +928,11 @@ impl CameraRig {
         self.slots().iter().map(|s| s.status()).collect()
     }
 
-    /// 这些相机都就绪；否则返回第一台的原因。
     pub fn all_ready(&self, cams: &[u8]) -> bool {
         cams.iter().all(|&c| self.slot(c as usize).is_some_and(|s| s.is_ready()))
     }
 
+    /// 这些相机都就绪；否则返回第一台的原因。
     pub fn check_ready_at(&self, cams: &[u8]) -> Result<(), String> {
         for &c in cams {
             let slot = self.slot(c as usize).ok_or("相机组改过了")?;
@@ -1092,13 +1092,8 @@ pub async fn camera_save_config(app: AppHandle, cam: usize, mut config: CameraCo
     // 海康相机要重新打开，检测中改会打断这一件
     check_idle(&app.state::<CycleHost>())?;
     let slot = rig(&app).slot(cam).ok_or("相机不存在")?;
-    let current = slot.config();
     // 编号是配方引用相机的依据，不能改
-    config.id = current.id;
-    // 留空的序列号连上后已固定（try_open）；界面里还是打开面板时的空值，不当成改回"第一台空闲的"
-    if config.source == CameraSource::Mvs && current.source == CameraSource::Mvs && config.serial.is_empty() {
-        config.serial = current.serial;
-    }
+    config.id = slot.config().id;
     check_serial(&rig(&app).configs(), cam, &config)?;
     slot.set_config(config);
     let saved = rig(&app).save();

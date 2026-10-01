@@ -201,7 +201,7 @@ impl VisionAssets {
 
     /// 模板与测量点文件按清单所在目录找：配方改名时整个目录跟着搬。
     pub fn load(path: &Path) -> Option<Self> {
-        let mut a: Self = std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok())?;
+        let mut a: Self = crate::fsio::read_text(path).ok().and_then(|s| serde_json::from_str(&s).ok())?;
         let dir = path.parent()?;
         for s in &mut a.shots {
             for p in [&mut s.template, &mut s.stations] {
@@ -383,7 +383,7 @@ pub struct CalibInfo {
 }
 
 pub fn calib_info(path: &Path) -> Option<CalibInfo> {
-    let doc: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let doc: Value = serde_json::from_str(&crate::fsio::read_text(path).ok()?).ok()?;
     let d = doc.get("data").unwrap_or(&doc);
     let f = |k: &str| d.get(k).and_then(|v| v.as_f64());
     Some(CalibInfo {

@@ -298,9 +298,11 @@ impl CycleHost {
         self.busy.load(Ordering::SeqCst)
     }
 
-    /// 检测中的配方：人工选中的，或在途工件用的。
+    /// 检测中的配方：人工选型号时选中的，或在途工件用的。
     pub fn recipe_in_use(&self, id: &str) -> bool {
-        self.busy() && (self.settings().manual_recipe_id.as_deref() == Some(id) || self.shared.lock().unwrap().part_recipe.as_ref().is_some_and(|r| r.id == id))
+        let settings = self.settings();
+        let selected = settings.product_source == ProductSource::Manual && settings.manual_recipe_id.as_deref() == Some(id);
+        self.busy() && (selected || self.shared.lock().unwrap().part_recipe.as_ref().is_some_and(|r| r.id == id))
     }
 
     pub fn push_progress(&self, raw: f32, poll_ts: i64) {
@@ -503,16 +505,19 @@ fn missing_recipe(id: &str) -> String {
     format!("选中的配方 {id} 不存在或没能加载（见配方页）")
 }
 
+/// PLC 用模拟器时没有实物：海康相机配模拟测量可以用来试触发、调曝光。
+pub fn real_parts(app: &AppHandle) -> bool {
+    plc(app).config().connection.protocol != ProtocolKind::Simulator
+}
+
 /// 配方用的相机此刻在相机组里的序号。相机不在相机组里、采集方式与工况不符、随动相机没标定、
-/// 实物检测时海康相机却没开图像测量时返回原因。
-pub fn usable_cams(app: &AppHandle, recipe: &Recipe) -> Result<Vec<u8>, String> {
+/// 实物检测（real_parts）时海康相机却没开图像测量时返回原因。
+pub fn usable_cams(app: &AppHandle, recipe: &Recipe, real_parts: bool) -> Result<Vec<u8>, String> {
     let host = host(app);
     let cams = host.camera.resolve(&recipe.cameras())?;
     let follow = recipe.mode == InspectMode::Follow;
     let settings = host.settings();
     let image = if follow { settings.follow_vision } else { settings.vision };
-    // PLC 用模拟器时没有实物，海康相机配模拟测量可以用来试触发、调曝光
-    let real_parts = plc(app).config().connection.protocol != ProtocolKind::Simulator;
     for &c in &cams {
         let cfg = host.camera.slot(c as usize).ok_or("相机组改过了")?.config();
         let free_run = cfg.acquisition == Acquisition::FreeRun;
@@ -566,6 +571,8 @@ struct Machine {
     camera_warnings: Vec<String>,
     /// camera_warnings 对应的配方
     camera_down: Vec<String>,
+    /// 上次生成 camera_warnings 的时刻：同一批配方开不了工时，原因也会变
+    camera_checked: Instant,
     dirty: bool,
     published: Instant,
     dropped_seen: u64,
@@ -595,6 +602,7 @@ impl Machine {
             config_warnings: Vec::new(),
             camera_warnings: Vec::new(),
             camera_down: Vec::new(),
+            camera_checked: Instant::now(),
             dirty: true,
             published: Instant::now(),
             dropped_seen: 0,
@@ -630,10 +638,11 @@ impl Machine {
         let host = host(&self.app);
         let rig_gen = host.camera.generation();
         let settings = host.settings();
+        let real = real_parts(&self.app);
         match settings.product_source {
             ProductSource::Manual => {
                 let cams = match (self.current_recipe(), settings.manual_recipe_id.as_deref()) {
-                    (Some(r), _) => usable_cams(&self.app, &r),
+                    (Some(r), _) => usable_cams(&self.app, &r, real),
                     (None, Some(id)) => Err(missing_recipe(id)),
                     (None, None) => Ok(Vec::new()),
                 };
@@ -642,7 +651,7 @@ impl Machine {
             ProductSource::Plc => {
                 let (mut watch, mut warnings) = (Vec::new(), Vec::new());
                 for r in host.recipes.list() {
-                    match usable_cams(&self.app, &r) {
+                    match usable_cams(&self.app, &r, real) {
                         Ok(c) => watch.push((r.id.clone(), c)),
                         Err(e) => warnings.push(format!("配方 {} 开不了工：{e}", r.id)),
                     }
@@ -668,19 +677,22 @@ impl Machine {
         }
         let req = self.required.as_ref().unwrap();
         let down: Vec<String> = req.watch.iter().filter(|(_, cams)| !host.camera.all_ready(cams)).map(|(id, _)| id.clone()).collect();
-        if down != self.camera_down {
+        if down != self.camera_down || (!down.is_empty() && self.camera_checked.elapsed() > Duration::from_secs(1)) {
+            self.camera_checked = Instant::now();
             let warnings: Vec<String> = req
                 .watch
                 .iter()
                 .filter(|(id, _)| down.contains(id))
                 .filter_map(|(id, cams)| host.camera.check_ready_at(cams).err().map(|e| format!("配方 {id} 暂时开不了工：{e}")))
                 .collect();
-            for w in warnings.iter().filter(|w| !self.camera_warnings.contains(w)) {
-                log(&self.app, "warn", "相机", w.clone());
+            if warnings != self.camera_warnings {
+                for w in warnings.iter().filter(|w| !self.camera_warnings.contains(w)) {
+                    log(&self.app, "warn", "相机", w.clone());
+                }
+                self.camera_warnings = warnings;
+                self.dirty = true;
             }
-            self.camera_warnings = warnings;
             self.camera_down = down;
-            self.dirty = true;
         }
         let none_usable = !req.warnings.is_empty() && req.watch.is_empty();
         if none_usable || (!req.watch.is_empty() && self.camera_down.len() == req.watch.len()) {
@@ -792,6 +804,8 @@ impl Machine {
             return self.refuse(sn, None, fault::NO_RECIPE, reason).await;
         };
         self.active_recipe = Some(recipe.clone());
+        // 从这一刻起这个配方算在检测中（不能删、不能改编号）
+        host.shared.lock().unwrap().part_recipe = Some(recipe.clone());
         let id = Some(recipe.id.clone());
         let n = recipe.shot_count();
         let follow = recipe.mode == InspectMode::Follow;
@@ -799,7 +813,7 @@ impl Machine {
             return self.refuse(sn, id, fault::SHOT_COUNT_MISMATCH, format!("PLC 下发拍照点数 {count}，配方 {} 为 {n}", recipe.id)).await;
         }
         let rig_gen = host.camera.generation();
-        let cams = match usable_cams(&app, &recipe) {
+        let cams = match usable_cams(&app, &recipe, real_parts(&app)) {
             Ok(c) => c,
             Err(reason) => return self.refuse(sn, id, fault::NO_RECIPE, reason).await,
         };
@@ -826,7 +840,6 @@ impl Machine {
         let camera_ids = recipe.cameras();
         let recording = host.recorder.begin(settings.record, sn, recipe.clone());
         host.camera.begin_part(&cams);
-        host.shared.lock().unwrap().part_recipe = Some(recipe.clone());
         self.part = Some(Part {
             sn,
             scenario: host.sim.part_scenario(),

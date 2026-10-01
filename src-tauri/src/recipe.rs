@@ -1121,7 +1121,7 @@ impl RecipeStore {
             for p in paths {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
                 let stem = p.file_stem().and_then(|n| n.to_str()).unwrap_or_default().to_string();
-                let parsed = std::fs::read_to_string(&p)
+                let parsed = crate::fsio::read_text(&p)
                     .map_err(|e| e.to_string())
                     .and_then(|s| serde_json::from_str::<RecipeDoc>(&s).map_err(|e| e.to_string()))
                     .and_then(|d| d.build().map(|r| (d, Arc::new(r))));

@@ -58,8 +58,11 @@ export default function CameraConfigPanel({ cam, initial, follow, status, onSave
     try {
       const next = { ...config, follow };
       const warnings = await cameraApi.saveConfig(cam, next);
+      // 取回后台固定的序列号
+      const fresh = (await cameraApi.rigConfig())[cam] ?? next;
+      setConfig(fresh);
       setNotice({ ok: warnings.length === 0, text: warnings.length ? `已应用，${warnings.length} 项参数相机未接受` : "已保存并应用" });
-      onSaved?.(next);
+      onSaved?.(fresh);
     } catch (e) {
       setNotice({ ok: false, text: String(e) });
     } finally {
