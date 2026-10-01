@@ -36,7 +36,8 @@ export default function CameraPage() {
   const config = configs[cam] ?? null;
   const status = statuses.find((s) => s.cam === cam) ?? null;
   const frameMs = status?.maxFps ? 1000 / status.maxFps : null;
-  const saved = (c: CameraConfig) => setConfigs((prev) => prev.map((p, i) => (i === cam ? c : p)));
+  // 保存后按后台为准重新取：序列号留空的相机这时已固定了序列号
+  const saved = () => void reload();
 
   const add = async () => {
     setError("");

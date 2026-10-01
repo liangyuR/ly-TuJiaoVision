@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { RefreshCw } from "lucide-react";
 import { cameraApi } from "../api";
 import type { CameraConfig, CameraSource, CameraStatus, DeviceSummary, FollowCalib, RecordEntry } from "../types";
@@ -39,11 +39,12 @@ export default function CameraConfigPanel({ cam, initial, follow, status, onSave
     if (config.source === "replay") cameraApi.records().then((r) => setRecords(r.items));
   }, [config.source]);
 
-  // 序列号留空的相机连上后后台已固定成那台
-  const connected = status?.device?.serial;
+  // 序列号留空的相机连上后后台会固定序列号，页面重新取配置后跟上；用户在表单里改过就不动
+  const shownSerial = useRef(initial.serial);
   useEffect(() => {
-    if (connected) setConfig((c) => (c.source === "mvs" && !c.serial ? { ...c, serial: connected } : c));
-  }, [connected]);
+    setConfig((c) => (c.serial === shownSerial.current ? { ...c, serial: initial.serial } : c));
+    shownSerial.current = initial.serial;
+  }, [initial.serial]);
 
   const set = <K extends keyof CameraConfig>(key: K, value: CameraConfig[K]) => setConfig({ ...config, [key]: value });
   const num = (key: "triggerDelayUs" | "debouncerUs" | "exposureUs" | "gainDb" | "fps" | "replayChannel", step = 1) => (
@@ -58,11 +59,9 @@ export default function CameraConfigPanel({ cam, initial, follow, status, onSave
     try {
       const next = { ...config, follow };
       const warnings = await cameraApi.saveConfig(cam, next);
-      // 取回后台固定的序列号
-      const fresh = (await cameraApi.rigConfig())[cam] ?? next;
-      setConfig(fresh);
       setNotice({ ok: warnings.length === 0, text: warnings.length ? `已应用，${warnings.length} 项参数相机未接受` : "已保存并应用" });
-      onSaved?.(fresh);
+      shownSerial.current = next.serial;
+      onSaved?.(next);
     } catch (e) {
       setNotice({ ok: false, text: String(e) });
     } finally {
