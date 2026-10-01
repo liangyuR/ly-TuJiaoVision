@@ -39,12 +39,13 @@ export default function CameraConfigPanel({ cam, initial, follow, status, onSave
     if (config.source === "replay") cameraApi.records().then((r) => setRecords(r.items));
   }, [config.source]);
 
-  // 序列号留空的相机连上后后台会固定序列号，页面重新取配置后跟上；用户在表单里改过就不动
+  // 序列号留空的相机连上后后台会固定序列号：页面每次重新取配置都跟上；用户在表单里改过还没保存就不动
   const shownSerial = useRef(initial.serial);
   useEffect(() => {
-    setConfig((c) => (c.serial === shownSerial.current ? { ...c, serial: initial.serial } : c));
+    const prev = shownSerial.current;
     shownSerial.current = initial.serial;
-  }, [initial.serial]);
+    setConfig((c) => (c.serial === prev ? { ...c, serial: initial.serial } : c));
+  }, [initial]);
 
   const set = <K extends keyof CameraConfig>(key: K, value: CameraConfig[K]) => setConfig({ ...config, [key]: value });
   const num = (key: "triggerDelayUs" | "debouncerUs" | "exposureUs" | "gainDb" | "fps" | "replayChannel", step = 1) => (
