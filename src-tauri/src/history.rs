@@ -71,6 +71,8 @@ pub struct Overrides {
     pub filter_window: Option<usize>,
     pub line: KindOverride,
     pub corner: KindOverride,
+    /// 胶宽限值（只作用于配置了胶宽的段）
+    pub width: KindOverride,
 }
 
 impl Overrides {
@@ -82,6 +84,9 @@ impl Overrides {
             match seg.kind {
                 SegmentKind::Line => self.line.apply(&mut seg.params),
                 SegmentKind::Corner => self.corner.apply(&mut seg.params),
+            }
+            if let Some(w) = seg.width.as_mut() {
+                self.width.apply(w);
             }
         }
         r
@@ -201,6 +206,7 @@ pub async fn history_export(app: AppHandle, query: HistoryQuery) -> Result<Strin
                     match p.trigger_mode.as_deref() {
                         Some("fly") => "飞拍",
                         Some("stop") => "停稳拍",
+                        Some("follow") => "随动",
                         _ => "",
                     },
                     verdict,
@@ -208,7 +214,8 @@ pub async fn history_export(app: AppHandle, query: HistoryQuery) -> Result<Strin
                     p.fault_code,
                     esc(&p.reason),
                     p.frames_received,
-                    p.frames_expected,
+                    // 随动没有计划帧数
+                    if p.trigger_mode.as_deref() == Some("follow") { String::new() } else { p.frames_expected.to_string() },
                     p.drain_ms.map(|v| v.to_string()).unwrap_or_default(),
                     p.retest_of.map(|v| v.to_string()).unwrap_or_default(),
                 )

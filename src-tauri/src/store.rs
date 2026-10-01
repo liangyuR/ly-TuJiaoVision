@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::cycle::FrameView;
 use crate::judge::{Judgement, PointState, Verdict};
-use crate::recipe::Recipe;
+use crate::recipe::{InspectMode, Recipe};
 
-/// 一件工件的完整结果，入库一行；测量点按弧长顺序压成一个 BLOB（每点 5 字节：f32 距离 + u8 状态）。
+/// 一件工件的完整结果，入库一行；测量点按弧长顺序压成一个 BLOB，格式见 POINTS_FORMAT。
 pub struct PartRecord<'a> {
     pub ts: i64,
     pub sn: u32,
@@ -17,14 +17,15 @@ pub struct PartRecord<'a> {
     pub judgement: &'a Judgement,
     pub drain_ms: Option<u64>,
     pub frames: &'a [FrameView],
+    pub frames_expected: usize,
     pub frames_received: usize,
     pub triggers: u64,
     pub table: Option<&'a [PointState]>,
     pub software_version: &'a str,
 }
 
-/// 测量点 BLOB 格式版本。1：每点 f32 距离 + u8 状态。P3 起改存内边与胶条两侧边缘时递增。
-const POINTS_FORMAT: i64 = 1;
+/// 测量点 BLOB 格式版本。1：每点 f32 位置 + u8 状态（5 字节）；2：f32 位置 + f32 胶宽 + u8 状态（9 字节）。
+const POINTS_FORMAT: i64 = 2;
 
 const ST_MEASURED: u8 = 0;
 const ST_GAP: u8 = 1;
@@ -32,24 +33,32 @@ const ST_INVALID: u8 = 2;
 const ST_PENDING: u8 = 3;
 
 fn encode(table: &[PointState]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(table.len() * 5);
+    let mut out = Vec::with_capacity(table.len() * 9);
     for p in table {
-        let (d, st) = match *p {
-            PointState::Measured(d) => (d, ST_MEASURED),
-            PointState::Gap => (0.0, ST_GAP),
-            PointState::Invalid => (0.0, ST_INVALID),
-            PointState::Pending => (0.0, ST_PENDING),
+        let (d, w, st) = match *p {
+            PointState::Measured { d, w } => (d, w, ST_MEASURED),
+            PointState::Gap => (0.0, f32::NAN, ST_GAP),
+            PointState::Invalid => (0.0, f32::NAN, ST_INVALID),
+            PointState::Pending => (0.0, f32::NAN, ST_PENDING),
         };
         out.extend_from_slice(&d.to_le_bytes());
+        out.extend_from_slice(&w.to_le_bytes());
         out.push(st);
     }
     out
 }
 
-pub fn decode(blob: &[u8]) -> Vec<PointState> {
-    blob.chunks_exact(5)
-        .map(|c| match c[4] {
-            ST_MEASURED => PointState::Measured(f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+/// 每点的 (位置, 胶宽, 状态)。
+fn raw_points(format: i64, blob: &[u8]) -> impl Iterator<Item = (f32, f32, u8)> + '_ {
+    let size = if format >= 2 { 9 } else { 5 };
+    let f = |c: &[u8]| f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+    blob.chunks_exact(size).map(move |c| if size == 9 { (f(c), f(&c[4..]), c[8]) } else { (f(c), f32::NAN, c[4]) })
+}
+
+pub fn decode(format: i64, blob: &[u8]) -> Vec<PointState> {
+    raw_points(format, blob)
+        .map(|(d, w, st)| match st {
+            ST_MEASURED => PointState::Measured { d, w },
             ST_GAP => PointState::Gap,
             ST_INVALID => PointState::Invalid,
             _ => PointState::Pending,
@@ -119,6 +128,8 @@ pub struct HistoryPage {
 #[serde(rename_all = "camelCase")]
 pub struct PartPoints {
     pub d: Vec<f32>,
+    /// 胶宽；没测胶宽的点为 null
+    pub w: Vec<Option<f32>>,
     pub st: Vec<u8>,
 }
 
@@ -261,13 +272,16 @@ impl Store {
                 r.recipe.map(|x| x.id.clone()),
                 r.recipe.map(|x| x.version),
                 r.recipe.map(|x| x.hash.clone()),
-                r.recipe.map(|x| serde_json::to_value(x.trigger_mode).ok().and_then(|v| v.as_str().map(String::from))),
+                r.recipe.map(|x| match x.mode {
+                    InspectMode::Follow => Some("follow".to_string()),
+                    InspectMode::FlyShot => serde_json::to_value(x.trigger_mode).ok().and_then(|v| v.as_str().map(String::from)),
+                }),
                 verdict_str(j.verdict),
                 j.plc_code,
                 j.fault_code,
                 j.reason,
                 r.drain_ms.map(|v| v as i64),
-                r.recipe.map_or(0, |x| x.shot_count() as i64),
+                r.frames_expected as i64,
                 r.frames_received as i64,
                 r.triggers as i64,
                 retest_of,
@@ -346,12 +360,16 @@ impl Store {
             .map_err(db_err)?
             .ok_or_else(|| format!("记录 {id} 不存在或已过期清理"))?;
         let points = conn
-            .query_row("SELECT data FROM part_points WHERE part_id = ?1", [id], |row| row.get::<_, Vec<u8>>(0))
+            .query_row("SELECT format, data FROM part_points WHERE part_id = ?1", [id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))
             .optional()
             .map_err(db_err)?
-            .map(|blob| PartPoints {
-                d: blob.chunks_exact(5).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
-                st: blob.chunks_exact(5).map(|c| c[4]).collect(),
+            .map(|(format, blob)| {
+                let raw: Vec<_> = raw_points(format, &blob).collect();
+                PartPoints {
+                    d: raw.iter().map(|p| p.0).collect(),
+                    w: raw.iter().map(|p| p.1.is_finite().then_some(p.1)).collect(),
+                    st: raw.iter().map(|p| p.2).collect(),
+                }
             });
         let mut stmt = conn.prepare("SELECT id FROM parts WHERE retest_of = ?1").map_err(db_err)?;
         let retests = stmt.query_map([id], |row| row.get(0)).map_err(db_err)?.collect::<Result<_, _>>().map_err(db_err)?;
@@ -382,7 +400,7 @@ impl Store {
             (format!(" WHERE id IN ({})", vec!["?"; ids.len()].join(",")), ids.iter().map(|&i| SqlValue::Integer(i)).collect())
         };
         let sql = format!(
-            "SELECT p.id, p.ts, p.sn, p.recipe_id, p.recipe_hash, p.verdict, pp.data FROM parts p
+            "SELECT p.id, p.ts, p.sn, p.recipe_id, p.recipe_hash, p.verdict, pp.format, pp.data FROM parts p
              JOIN part_points pp ON pp.part_id = p.id{filter} ORDER BY p.id DESC LIMIT {limit}"
         );
         let mut stmt = conn.prepare(&sql).map_err(db_err)?;
@@ -395,7 +413,7 @@ impl Store {
                     recipe_id: row.get(3)?,
                     recipe_hash: row.get(4)?,
                     verdict: parse_verdict(&row.get::<_, String>(5)?),
-                    table: decode(&row.get::<_, Vec<u8>>(6)?),
+                    table: decode(row.get(6)?, &row.get::<_, Vec<u8>>(7)?),
                 })
             })
             .map_err(db_err)?;

@@ -3,10 +3,10 @@ import { useNavigate } from "react-router-dom";
 import Modal from "../../plc/components/Modal";
 import type { Verdict } from "../../cycle/types";
 import { historyApi } from "../api";
-import { formatTime, verdictClass, verdictLabel } from "../meta";
+import { formatTime, verdictClass, verdictGroups, verdictLabel } from "../meta";
 import type { HistoryQuery, KindOverride, Overrides, RejudgeResult } from "../types";
 
-const order: Verdict[] = ["OK", "OK_WITH_EXCURSION", "NG_POSITION", "NG_ABSOLUTE", "NG_GAP"];
+const order: Verdict[] = verdictGroups.flatMap((g) => g.verdicts);
 const kindFields: [keyof KindOverride, string][] = [
   ["tolUpper", "上公差"],
   ["tolLower", "下公差"],
@@ -26,7 +26,7 @@ function numOrUndef(s: string) {
 export default function RejudgeDialog({ query, total, onClose }: { query: HistoryQuery; total: number; onClose: () => void }) {
   const navigate = useNavigate();
   const [useCurrent, setUseCurrent] = useState(false);
-  const [overrides, setOverrides] = useState<Overrides>({ line: {}, corner: {} });
+  const [overrides, setOverrides] = useState<Overrides>({ line: {}, corner: {}, width: {} });
   const [result, setResult] = useState<RejudgeResult | null>(null);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState("");
@@ -43,14 +43,14 @@ export default function RejudgeDialog({ query, total, onClose }: { query: Histor
     }
   };
 
-  const kind = (k: "line" | "corner", f: keyof KindOverride) => (
+  const kind = (k: "line" | "corner" | "width", f: keyof KindOverride) => (
     <input
       id={`rj-${k}-${f}`}
       className="input mono"
       type="number"
       step={0.05}
       placeholder="不变"
-      value={overrides[k][f] ?? ""}
+      value={overrides[k]?.[f] ?? ""}
       onChange={(e) => setOverrides({ ...overrides, [k]: { ...overrides[k], [f]: numOrUndef(e.target.value) } })}
     />
   );
@@ -86,6 +86,8 @@ export default function RejudgeDialog({ query, total, onClose }: { query: Histor
           {kindFields.map(([f]) => <div key={f}>{kind("line", f)}</div>)}
           <span>R 角</span>
           {kindFields.map(([f]) => <div key={f}>{kind("corner", f)}</div>)}
+          <span title="只作用于配置了胶宽判定的段">胶宽</span>
+          {kindFields.map(([f]) => <div key={f}>{kind("width", f)}</div>)}
         </div>
         <div className="row">
           <label className="field">

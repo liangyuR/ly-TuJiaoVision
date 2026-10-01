@@ -20,9 +20,17 @@ libloading = "0.8"
 rusqlite = { version = "0.40", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # lyFlow main 暂无图像注入与 glue 积木，vision::Engine::run 先直接报错；glue 合入后恢复
-lyflow-client = { git = "ssh://git@github.com/liangyuR/lyFlow.git", branch = "main" }
+lyflow-client = { git = "ssh://git@github.com/liangyuR/lyFlow.git", rev = "b2e7b2cb7623170c9e2f7a91bb2d46deaa236420" }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "pnm", "bmp", "tiff"] }
 ly-plc = { git = "ssh://git@github.com/liangyuR/ly-plc.git", branch = "main" }
 
 # 模拟相机逐像素合成图像，未优化时一帧要一两秒，赶不上节拍
 [profile.dev.package.tujiao-vision]
 opt-level = 2
+
+# 回放相机解码 JPEG：未优化时一帧几百毫秒
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.zune-jpeg]
+opt-level = 3

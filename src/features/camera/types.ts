@@ -1,8 +1,24 @@
-export type CameraSource = "sim" | "mvs";
+export type CameraSource = "sim" | "mvs" | "replay";
+export type Acquisition = "triggered" | "freeRun";
+
+/** 随动相机相对胶嘴的标定 */
+export interface FollowCalib {
+  nozzle: [number, number];
+  angleDeg: number;
+  mirror: boolean;
+  mmPerPx: number;
+  maskPx: number;
+  imageSize: [number, number];
+}
 
 export interface CameraConfig {
+  /** 相机编号：配方用它引用相机，建相机时分配、之后不变 */
+  id: string;
+  name: string;
   source: CameraSource;
   serial: string;
+  acquisition: Acquisition;
+  fps: number;
   triggerSource: "Line0" | "Software";
   triggerActivation: "RisingEdge" | "FallingEdge";
   triggerDelayUs: number;
@@ -11,6 +27,9 @@ export interface CameraConfig {
   gainDb: number;
   strobe: boolean;
   chunk: boolean;
+  replayDir: string;
+  replayChannel: number;
+  follow: FollowCalib | null;
 }
 
 export interface DeviceSummary {
@@ -22,7 +41,11 @@ export interface DeviceSummary {
 }
 
 export interface CameraStatus {
+  cam: number;
+  id: string;
+  name: string;
   source: CameraSource;
+  acquisition: Acquisition;
   ready: boolean;
   message: string;
   device: DeviceSummary | null;
@@ -31,10 +54,12 @@ export interface CameraStatus {
   fps: number;
   maxFps: number | null;
   lostPackets: number;
+  droppedFrames: number;
   warnings: string[];
 }
 
 export interface Frame {
+  cam: number;
   frameCounter: number;
   triggerCounter: number;
   lostPackets: number;
@@ -42,8 +67,24 @@ export interface Frame {
 }
 
 export interface DryFrame {
+  cam: number;
   tMs: number;
   frameCounter: number;
   triggerCounter: number;
   lostPackets: number;
+}
+
+/** 缩略图：像素为缩略图尺寸，full 为原图尺寸 */
+export interface PreviewImage {
+  width: number;
+  height: number;
+  fullWidth: number;
+  fullHeight: number;
+  data: ImageData;
+}
+
+export interface RecordEntry {
+  path: string;
+  name: string;
+  frames: number;
 }

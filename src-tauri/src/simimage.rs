@@ -144,7 +144,8 @@ fn view(recipe: &Recipe, k: usize) -> (f64, f64, u32, u32) {
     (cx - fw / 2.0, cy - fh / 2.0, (fw / SIM_MM_PER_PX).round() as u32, (fh / SIM_MM_PER_PX).round() as u32)
 }
 
-fn noise(i: u64, seed: u64) -> f64 {
+/// 由像素序号与种子得到 [-1, 1) 的确定性噪声（splitmix64）。
+pub fn noise(i: u64, seed: u64) -> f64 {
     let mut z = i.wrapping_add(seed.wrapping_mul(0x9E3779B97F4A7C15));
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
@@ -183,7 +184,7 @@ pub fn render(recipe: &Recipe, k: usize, scenario: Scenario, pose: PoseError, se
             });
         }
     });
-    FrameImage { width: w, height: h, pixels }
+    FrameImage::new(w, h, pixels)
 }
 
 fn write_pgm(path: &Path, img: &FrameImage, x: u32, y: u32, w: u32, h: u32) -> Result<(), String> {
@@ -241,8 +242,7 @@ pub fn teach(recipe: &Recipe, dir: &Path) -> Result<VisionAssets, String> {
             normals.push(json!([nx, ny]));
             ids.push(j);
         }
-        let stations = dir.join(format!("k{k}.stations.json"));
-        std::fs::write(&stations, json!({"points": points, "normals": normals, "ids": ids}).to_string()).map_err(|e| e.to_string())?;
+        let stations = crate::vision::save_stations(dir, k, points, normals, ids)?;
         shots.push(ShotAssets { template, anchor: [ax as f64, ay as f64], stations });
     }
     Ok(VisionAssets {
@@ -251,5 +251,6 @@ pub fn teach(recipe: &Recipe, dir: &Path) -> Result<VisionAssets, String> {
         sim_mm_per_px: Some(px),
         calib,
         shots,
+        camera: recipe.camera.clone(),
     })
 }

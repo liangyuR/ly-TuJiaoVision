@@ -1,4 +1,7 @@
-use ly_plc::{Access, ConnectionConfig, DataType, EdgeMode, HeartbeatConfig, PlcConfig, PlcEngine, PlcPoint, PlcValue};
+use std::collections::HashMap;
+use std::sync::RwLock;
+
+use ly_plc::{Access, ConnectionConfig, DataType, EdgeMode, HeartbeatConfig, PlcConfig, PlcEngine, PlcPoint, PlcValue, PointValue};
 use serde_json::Value;
 
 pub mod tag {
@@ -16,10 +19,31 @@ pub mod tag {
     pub const RESULT_CODE: &str = "resultCode";
     pub const FAULT_CODE: &str = "faultCode";
     pub const RESULT_SN: &str = "resultSn";
+    /// 随动：机器人已走过的胶路弧长（按配方里的换算系数转成 mm）
+    pub const PATH_PROGRESS: &str = "pathProgress";
 }
 
-fn point_id(engine: &PlcEngine, tag: &str) -> Option<String> {
-    engine.config().points.into_iter().find(|p| p.tags.iter().any(|t| t == tag)).map(|p| p.id)
+/// 标签 → 点位 id。随动每帧都要读进度，不能每次都把整个地址表克隆一遍；地址表保存后清空重建。
+static TAG_IDS: RwLock<Option<HashMap<String, String>>> = RwLock::new(None);
+
+pub fn invalidate_tags() {
+    *TAG_IDS.write().unwrap() = None;
+}
+
+pub fn point_id(engine: &PlcEngine, tag: &str) -> Option<String> {
+    if let Some(map) = TAG_IDS.read().unwrap().as_ref() {
+        return map.get(tag).cloned();
+    }
+    let mut map = HashMap::new();
+    for p in engine.config().points {
+        for t in p.tags {
+            // 同一标签挂在多个点位上时取第一个，与原来的查找顺序一致
+            map.entry(t).or_insert_with(|| p.id.clone());
+        }
+    }
+    let id = map.get(tag).cloned();
+    *TAG_IDS.write().unwrap() = Some(map);
+    id
 }
 
 pub fn read_tag(engine: &PlcEngine, tag: &str) -> Option<PlcValue> {
@@ -29,6 +53,21 @@ pub fn read_tag(engine: &PlcEngine, tag: &str) -> Option<PlcValue> {
 
 pub fn tag_is_on(engine: &PlcEngine, tag: &str) -> bool {
     read_tag(engine, tag).is_some_and(|v| v.is_truthy())
+}
+
+/// 点位的数值与读到它的轮询时刻（ms）。
+pub fn value_f32_ts(v: &PointValue) -> Option<(f32, i64)> {
+    let x = match v.value.as_ref()? {
+        PlcValue::Int(i) => *i as f32,
+        PlcValue::Float(f) => *f as f32,
+        PlcValue::Bool(b) => *b as u8 as f32,
+    };
+    Some((x, v.ts))
+}
+
+pub fn read_tag_f32_ts(engine: &PlcEngine, tag: &str) -> Option<(f32, i64)> {
+    let id = point_id(engine, tag)?;
+    value_f32_ts(engine.values().get(&id)?)
 }
 
 pub fn read_tag_u32(engine: &PlcEngine, tag: &str) -> Option<u32> {
@@ -69,6 +108,7 @@ pub fn default_plc_config() -> PlcConfig {
             point("p_part_sn", "工件序列号", "HR100", U32, NoEdge, tag::PART_SN),
             point("p_product_code", "产品代码", "HR102", U16, NoEdge, tag::PRODUCT_CODE),
             point("p_shot_count", "计划拍照点数", "HR103", U16, NoEdge, tag::SHOT_COUNT),
+            PlcPoint { log_changes: false, ..point("p_path_progress", "随动进度（0.1 mm）", "HR104", U32, NoEdge, tag::PATH_PROGRESS) },
             point("p_vision_ready", "视觉就绪", "C20", Bool, NoEdge, tag::VISION_READY),
             point("p_armed", "已布防", "C21", Bool, NoEdge, tag::ARMED),
             point("p_busy", "检测中", "C22", Bool, NoEdge, tag::BUSY),

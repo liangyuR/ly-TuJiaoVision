@@ -28,6 +28,13 @@ impl PlcHost {
                 let _ = handle.emit("plc://status", s);
             }
             PlcEvent::Values(v) => {
+                // 随动按进度定位要每一次变化，节拍处理帧慢了也不漏
+                if let (Some(cycle), Some(plc)) = (handle.try_state::<CycleHost>(), handle.try_state::<PlcHost>()) {
+                    let progress = inspection::point_id(plc.engine(), inspection::tag::PATH_PROGRESS).and_then(|id| v.get(&id)).and_then(inspection::value_f32_ts);
+                    if let Some((raw, ts)) = progress {
+                        cycle.push_progress(raw, ts);
+                    }
+                }
                 let _ = handle.emit("plc://values", v);
             }
             PlcEvent::Logs(l) => {
@@ -65,10 +72,14 @@ pub fn plc_get_config(plc: State<'_, PlcHost>) -> PlcConfig {
 }
 
 #[tauri::command]
-pub async fn plc_save_config(plc: State<'_, PlcHost>, config: PlcConfig) -> Result<(), String> {
+pub async fn plc_save_config(plc: State<'_, PlcHost>, cycle: State<'_, CycleHost>, config: PlcConfig) -> Result<(), String> {
     config.validate()?;
     config.save(&plc.config_path)?;
-    plc.engine.apply_config(config).await
+    let r = plc.engine.apply_config(config).await;
+    inspection::invalidate_tags();
+    // 开工检查看 PLC 是不是模拟器
+    let _ = cycle.tx.send(Input::Refresh);
+    r
 }
 
 #[tauri::command]

@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { ChevronLeft, ChevronRight, Download, RefreshCw, Scale } from "lucide-react";
 import { subscribe } from "../features/plc";
 import { useRecipes } from "../features/cycle";
-import { formatTime, historyApi, RejudgeDialog, verdictClass, verdictGroups, verdictLabel, type HistoryPage as Page, type HistoryQuery } from "../features/history";
+import { formatTime, historyApi, RejudgeDialog, triggerModeLabel, verdictClass, verdictGroups, verdictLabel, type HistoryPage as Page, type HistoryQuery } from "../features/history";
 
 const PAGE = 50;
 const ranges: [string, string, number | null][] = [
@@ -148,12 +148,12 @@ export default function HistoryPage() {
                   <td className="nowrap">
                     {p.recipeId ?? "—"}
                     {p.recipeVersion != null && <span className="muted"> v{p.recipeVersion}</span>}
-                    {p.triggerMode && <span className="muted"> · {p.triggerMode === "stop" ? "停稳拍" : "飞拍"}</span>}
+                    {p.triggerMode && <span className="muted"> · {triggerModeLabel(p.triggerMode)}</span>}
                   </td>
                   <td className="nowrap"><span className={`vt ${verdictClass(p.verdict)}`}>{verdictLabel[p.verdict]}</span></td>
                   <td className="mono">{p.plcCode}{p.faultCode ? ` / ${p.faultCode}` : ""}</td>
                   <td className="reason">{p.reason}</td>
-                  <td className="mono nowrap">{p.framesExpected ? `${p.framesReceived}/${p.framesExpected}` : "—"}</td>
+                  <td className="mono nowrap">{p.triggerMode === "follow" ? `收 ${p.framesReceived}` : p.framesExpected ? `${p.framesReceived}/${p.framesExpected}` : "—"}</td>
                   <td className="mono nowrap">{p.drainMs != null ? `${p.drainMs} ms` : "—"}</td>
                 </tr>
               ))}

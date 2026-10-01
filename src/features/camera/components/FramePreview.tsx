@@ -1,38 +1,17 @@
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { Zap } from "lucide-react";
-import { cameraApi } from "../api";
+import { cameraApi, usePreviewCanvas } from "../api";
 import type { CameraConfig, CameraStatus, Frame } from "../types";
 
-export default function FramePreview({ status, lastFrame, config }: { status: CameraStatus | null; lastFrame: Frame | null; config: CameraConfig | null }) {
-  const canvas = useRef<HTMLCanvasElement>(null);
-  const [size, setSize] = useState<[number, number] | null>(null);
+export default function FramePreview({ cam, status, lastFrame, config }: { cam: number; status: CameraStatus | null; lastFrame: Frame | undefined; config: CameraConfig | null }) {
+  const { img, canvas } = usePreviewCanvas(cam, lastFrame?.frameCounter);
   const [error, setError] = useState("");
-
-  useEffect(() => {
-    if (!lastFrame || status?.source !== "mvs") return;
-    cameraApi.preview().then((buf) => {
-      if (buf.byteLength < 8 || !canvas.current) return;
-      const view = new DataView(buf);
-      const w = view.getUint32(0, true), h = view.getUint32(4, true);
-      const px = new Uint8Array(buf, 8);
-      const el = canvas.current;
-      el.width = w;
-      el.height = h;
-      const img = new ImageData(w, h);
-      for (let i = 0; i < w * h; i++) {
-        const g = px[i];
-        img.data[i * 4] = img.data[i * 4 + 1] = img.data[i * 4 + 2] = g;
-        img.data[i * 4 + 3] = 255;
-      }
-      el.getContext("2d")?.putImageData(img, 0, 0);
-      setSize([w, h]);
-    });
-  }, [lastFrame, status?.source]);
 
   const soft = () => {
     setError("");
-    cameraApi.softTrigger().catch((e) => setError(String(e)));
+    cameraApi.softTrigger(cam).catch((e) => setError(String(e)));
   };
+  const canTrigger = config?.source === "replay" || (config?.acquisition === "triggered" && config.source === "mvs" && config.triggerSource === "Software");
 
   return (
     <div className="panel">
@@ -42,17 +21,18 @@ export default function FramePreview({ status, lastFrame, config }: { status: Ca
           <span className="muted mono">
             帧 {lastFrame.frameCounter} · 触发 {lastFrame.triggerCounter}
             {lastFrame.lostPackets ? ` · 丢包 ${lastFrame.lostPackets}` : ""}
+            {img && ` · ${img.fullWidth}×${img.fullHeight}`}
           </span>
         )}
         <span className="spacer" />
-        <button className="btn" onClick={soft} disabled={status?.source !== "mvs" || config?.triggerSource !== "Software"} title="触发源为 Software 时可用">
+        <button className="btn" onClick={soft} disabled={!canTrigger} title="回放相机，或触发源为 Software 的触发采集海康相机">
           <Zap size={15} />
-          软触发一次
+          {config?.source === "replay" ? "下一张" : "软触发一次"}
         </button>
       </div>
       <div className="preview-box">
-        <canvas ref={canvas} style={{ display: size ? "block" : "none" }} />
-        {!size && <span className="muted">{status?.source === "mvs" ? "暂无图像（仅显示 Mono8）" : "模拟相机不产生图像"}</span>}
+        <canvas ref={canvas} style={{ display: img ? "block" : "none" }} />
+        {!img && <span className="muted">{status?.ready ? "暂无图像（仅显示 Mono8）" : status?.message}</span>}
       </div>
       {error && <span className="c-ng" style={{ fontSize: 12 }}>{error}</span>}
     </div>

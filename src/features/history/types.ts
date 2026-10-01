@@ -47,7 +47,7 @@ export interface PartDetail {
   frames: FrameView[];
   triggers: number;
   softwareVersion: string;
-  points: { d: number[]; st: number[] } | null;
+  points: { d: number[]; w?: (number | null)[]; st: number[] } | null;
   retests: number[];
 }
 
@@ -64,6 +64,8 @@ export interface Overrides {
   filterWindow?: number;
   line: KindOverride;
   corner: KindOverride;
+  /** 胶宽限值（只作用于配置了胶宽的段） */
+  width?: KindOverride;
 }
 
 export interface RejudgeRequest {
